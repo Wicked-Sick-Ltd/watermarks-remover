@@ -20,10 +20,10 @@ transformers==5.17.0
 # transformers 5.17.0 requires tokenizers>=0.23.1,<0.24.0
 tokenizers==0.23.2
 datasets==5.0.1
-accelerate==1.14.0
+accelerate==1.15.0
 SentencePiece==0.2.2
-# 3.10.3 is the latest PyPI release. Dependabot High GHSA-8mgp-746c-j5xp /
-# CVE-2026-81726 still lists <=3.10.3 with no first_patched_version.
+# Latest PyPI release. Dependabot High GHSA-8mgp-746c-j5xp / CVE-2026-81726
+# still lists <=3.10.3 with no first_patched_version.
 nltk==3.10.3
 jieba==0.42.1
 tqdm==4.70.0

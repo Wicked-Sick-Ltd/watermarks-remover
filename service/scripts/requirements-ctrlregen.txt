@@ -9,7 +9,7 @@
 # >=5.10.0, diffusers >=0.38.0). Re-validate CtrlRegen against the pinned
 # noai-watermark commit after bumps: released diffusers 0.40.0 requires
 # huggingface_hub>=1.23.0 and transformers 5.x (tokenizers>=0.23.1).
-# accelerate stays 1.14.0 (Medium GHSA, no High first_patched_version).
+# accelerate tracks the Dependabot pip group (1.15.0).
 # Pillow stays 12.3.0 (not in the High pip set).
 #
 # This file is only ever installed inside the dedicated venv created by
@@ -19,7 +19,7 @@
 # this file if you need a report.
 diffusers==0.40.0
 transformers==5.17.0
-accelerate==1.14.0
+accelerate==1.15.0
 controlnet-aux==0.0.10
 color-matcher==0.6.0
 safetensors==0.8.0

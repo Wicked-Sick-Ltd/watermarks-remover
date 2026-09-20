@@ -65,6 +65,32 @@ TEXT_EXTS = {
     ".csv",
 }
 
+#: Every extension the pipelines route on. Longest first so ".markdown" wins
+#: over a hypothetical ".md" prefix match in allowlisted_suffix.
+KNOWN_EXTS: tuple[str, ...] = tuple(
+    sorted(IMAGE_EXTS | CONTAINER_EXTS | TEXT_EXTS | AV_EXTS, key=len, reverse=True)
+)
+
+
+def allowlisted_suffix(name: str) -> str:
+    """Return *name*'s extension as one of :data:`KNOWN_EXTS`, or ``""``.
+
+    The return value is always an element of the allowlist rather than a slice
+    of *name*, so a caller can build a filesystem path from it without any
+    untrusted byte reaching the path. That is what makes it safe to derive a
+    temp filename from a client-supplied ``name``: traversal segments, absolute
+    prefixes, NUL bytes and Windows separators cannot survive a comparison that
+    only ever yields a fixed literal.
+
+    An unknown or absent extension yields ``""``; callers keep their own
+    fallback, because format routing is the caller's decision, not ours.
+    """
+    lowered = name.lower()
+    for ext in KNOWN_EXTS:
+        if lowered.endswith(ext):
+            return ext
+    return ""
+
 
 def classify_bytes(data: bytes, suffix: str | None = None) -> Kind:
     """Classify *data* by extension first, then by magic bytes.

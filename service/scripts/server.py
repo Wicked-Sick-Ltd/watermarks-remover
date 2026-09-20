@@ -62,7 +62,7 @@ from common import (
     which,
 )
 from container_meta import DEEP_IMAGE_MODES, clean_container, inspect_container
-from format_dispatch import classify_bytes
+from format_dispatch import allowlisted_suffix, classify_bytes
 from image_meta import clean_image, inspect_image, run_synthid_score
 from score_stylometry import score_text_stylometry
 from text_detectors import detector_status, run_all_text_detectors, run_text_detectors
@@ -569,17 +569,33 @@ def openapi_spec() -> dict[str, Any]:
 
 
 def _safe_name(name: str) -> str:
-    """Reduce a client-supplied filename to a bare basename safe for temp use.
+    """Reduce a client-supplied filename to a bare basename.
 
-    CodeQL (uncontrolled data in path expression): a name like '../../x'
-    would otherwise let the write below escape the request temp dir. Fold
-    Windows separators too, and fall back to a neutral name for '.', '..' or
-    empty results.
+    This is the *reporting* name echoed back in responses, not a path
+    component: every filesystem path in this module is built by ``_temp_name``
+    instead. Traversal segments are still folded away (including Windows
+    separators) so nothing downstream can be misled by a name like '../../x',
+    with a neutral fallback for '.', '..' or empty results.
     """
     base = Path(name.replace("\\", "/")).name
     if base in ("", ".", ".."):
         return "input"
     return base
+
+
+def _temp_name(name: str) -> str:
+    """Filename for this request's temp copy: fixed stem + allowlisted extension.
+
+    The client-supplied *name* only ever selects a literal from
+    ``format_dispatch.KNOWN_EXTS``, so no byte of it reaches the path. That is
+    what confines every read and write below to the per-request temp directory:
+    traversal segments, absolute prefixes and NUL bytes cannot survive a
+    comparison whose result is always a fixed extension (or "").
+
+    The extension itself has to be kept, because the container and image
+    pipelines route on the suffix of the file they are handed.
+    """
+    return f"input{allowlisted_suffix(name)}"
 
 
 def _decode_input(body: dict[str, Any]) -> tuple[bytes, str]:
@@ -657,7 +673,7 @@ def _batch_items(
 
 
 def _inspect_payload(data: bytes, name: str, run_detect: bool) -> dict[str, Any]:
-    kind = classify_bytes(data, Path(name).suffix)
+    kind = classify_bytes(data, allowlisted_suffix(name))
     if kind == "unknown":
         return {
             "ok": True,
@@ -666,7 +682,7 @@ def _inspect_payload(data: bytes, name: str, run_detect: bool) -> dict[str, Any]
             "suspicious": False,
         }
     with tempfile.TemporaryDirectory(prefix="wm-inspect-") as tmp:
-        path = confined_path(tmp, name or "input")
+        path = confined_path(tmp, _temp_name(name))
         path.write_bytes(data)
         if kind == "text":
             if looks_binary(data):
@@ -699,9 +715,9 @@ def _inspect_payload(data: bytes, name: str, run_detect: bool) -> dict[str, Any]
 
 
 def _detect_payload(data: bytes, name: str) -> dict[str, Any]:
-    kind = classify_bytes(data, Path(name).suffix)
+    kind = classify_bytes(data, allowlisted_suffix(name))
     with tempfile.TemporaryDirectory(prefix="wm-detect-") as tmp:
-        path = confined_path(tmp, name or "input")
+        path = confined_path(tmp, _temp_name(name))
         path.write_bytes(data)
         if kind == "text":
             if looks_binary(data):
@@ -747,7 +763,7 @@ def _detect_payload(data: bytes, name: str) -> dict[str, Any]:
 
 
 def _clean_payload(data: bytes, name: str, options: dict[str, Any]) -> dict[str, Any]:
-    kind = classify_bytes(data, Path(name).suffix)
+    kind = classify_bytes(data, allowlisted_suffix(name))
     if kind == "unknown":
         raise ValueError(
             "unrecognized file format; use a filename with a known extension "
@@ -756,7 +772,7 @@ def _clean_payload(data: bytes, name: str, options: dict[str, Any]) -> dict[str,
 
     with tempfile.TemporaryDirectory(prefix="wm-clean-") as tmp:
         tmpdir = Path(tmp)
-        src = confined_path(tmpdir, name or "input")
+        src = confined_path(tmpdir, _temp_name(name))
         src.write_bytes(data)
         if kind == "text":
             if looks_binary(data):
@@ -781,7 +797,7 @@ def _clean_payload(data: bytes, name: str, options: dict[str, Any]) -> dict[str,
             if detector_reports:
                 report["text_detectors"] = detector_reports
         elif kind == "image":
-            ext = Path(name).suffix
+            ext = allowlisted_suffix(name)
             if not ext:
                 from image_meta import detect_format
 
@@ -807,7 +823,7 @@ def _clean_payload(data: bytes, name: str, options: dict[str, Any]) -> dict[str,
             cleaned_bytes = dest.read_bytes()
             report = {"kind": "image", **result}
         elif kind == "av":
-            dest = confined_path(tmpdir, f"out{Path(name).suffix or '.bin'}")
+            dest = confined_path(tmpdir, f"out{allowlisted_suffix(name) or '.bin'}")
             strip_all = not bool(options.get("keep_non_ai_metadata"))
             if "strip_all_metadata" in options:
                 strip_all = bool(options["strip_all_metadata"])
@@ -815,7 +831,7 @@ def _clean_payload(data: bytes, name: str, options: dict[str, Any]) -> dict[str,
             cleaned_bytes = dest.read_bytes()
             report = {"kind": "av", **result}
         else:
-            ext = Path(name).suffix
+            ext = allowlisted_suffix(name)
             container_fmt = None
             if not ext:
                 from container_meta import detect_container_format

@@ -19,7 +19,7 @@
 ARG NOAI_WATERMARK_REF=b642ae45d20eded52c96d570985eb4e3e427aac8
 
 # python:3.11-slim (multi-arch manifest digest). Keep the CtrlRegen image
-# on 3.11 so the pinned HF cluster (transformers 5.10.x / diffusers 0.38.x)
+# on 3.11 so the pinned HF cluster (transformers 5.17.0 / diffusers 0.40.0)
 # and remaining research-era pins resolve on a known wheel set.
 FROM python:3.11-slim@sha256:a630a63cdb314e2d138a2fca3e375e319e8568346ffafac5b980f888630ac4f1
 

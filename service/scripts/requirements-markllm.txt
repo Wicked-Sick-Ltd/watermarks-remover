@@ -16,13 +16,14 @@
 # GPU when nvidia-smi is present), then this file's remaining pins resolve
 # against the already-installed torch.
 torch==2.13.0.*
-transformers==5.15.0
-# transformers 5.15.0 caps tokenizers at <=0.23.0; there is no 0.23.0
-# release (0.22.2 -> 0.23.1), so the highest compatible pin is 0.22.2.
-tokenizers==0.22.2
+transformers==5.17.0
+# transformers 5.17.0 requires tokenizers>=0.23.1,<0.24.0
+tokenizers==0.23.2
 datasets==5.0.1
 accelerate==1.14.0
 SentencePiece==0.2.2
+# 3.10.3 is the latest PyPI release. GHSA-8mgp-746c-j5xp (CVE-2026-81726)
+# still lists <=3.10.3 as affected with no first_patched_version.
 nltk==3.10.3
 jieba==0.42.1
 tqdm==4.70.0

@@ -544,9 +544,9 @@ maintained reimplementation of the ICLR 2025
 
 The backend is **not bundled** and ships no LICENSE file, so it is treated as
 all-rights-reserved: it is cloned at a pinned commit and loaded at runtime.
-Its research-era dependency pins (`requirements-ctrlregen.txt` — e.g.
-`transformers==4.37.2`, `diffusers==0.27.2`) carry published advisories and
-are intentionally not current, so they are only ever installed inside the
+Its Hugging Face pins (`requirements-ctrlregen.txt` — e.g.
+`transformers==5.17.0`, `diffusers==0.40.0`) are kept current for published
+High advisories and are only ever installed inside the
 dedicated venv this script creates and never into the main service image;
 `setup_ctrlregen.sh` also re-verifies the pinned commit on existing
 checkouts, not just fresh clones.

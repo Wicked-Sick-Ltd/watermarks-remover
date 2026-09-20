@@ -18,10 +18,9 @@
 # Pinned upstream commit (2026-08-13). Keep in sync with setup_ctrlregen.sh.
 ARG NOAI_WATERMARK_REF=b642ae45d20eded52c96d570985eb4e3e427aac8
 
-# python:3.11-slim (multi-arch manifest digest). The pinned ML deps below are
-# research-era pins (diffusers 0.27.2 / transformers 4.37.2 -> tokenizers<0.19)
-# that ship no Python 3.14 wheels; 3.11 is the newest base with prebuilt wheels
-# for all of them.
+# python:3.11-slim (multi-arch manifest digest). Kept on 3.11 for a stable
+# CtrlRegen runtime even though current HF pins (diffusers 0.40.0 /
+# transformers 5.17.0) ship newer wheels.
 FROM python:3.11-slim@sha256:a630a63cdb314e2d138a2fca3e375e319e8568346ffafac5b980f888630ac4f1
 
 ARG NOAI_WATERMARK_REF

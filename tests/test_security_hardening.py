@@ -21,6 +21,7 @@ import common
 import container_meta
 from common import (
     backup_path,
+    confined_path,
     read_text_input,
     safe_arg,
     safe_write_bytes,
@@ -148,6 +149,37 @@ def test_inspect_docx_with_ai_markers_does_not_crash():
 # ---------------------------------------------------------------------------
 # Safe (atomic, symlink-safe) writes
 # ---------------------------------------------------------------------------
+
+
+def test_confined_path_canonicalizes_child_under_root(tmp_path: Path):
+    root = tmp_path / "sandbox"
+    root.mkdir()
+    assert confined_path(root, "nested", "..", "out.txt") == root.resolve() / "out.txt"
+
+
+@pytest.mark.parametrize("child", ("../escape.txt", "../../escape.txt"))
+def test_confined_path_refuses_parent_traversal(tmp_path: Path, child: str):
+    root = tmp_path / "sandbox"
+    root.mkdir()
+    with pytest.raises(ValueError, match="escapes"):
+        confined_path(root, child)
+
+
+def test_confined_path_refuses_absolute_child(tmp_path: Path):
+    root = tmp_path / "sandbox"
+    root.mkdir()
+    with pytest.raises(ValueError, match="relative"):
+        confined_path(root, tmp_path / "escape.txt")
+
+
+def test_confined_path_refuses_symlink_escape(tmp_path: Path):
+    root = tmp_path / "sandbox"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _make_symlink(root / "link", outside)
+    with pytest.raises(ValueError, match="escapes"):
+        confined_path(root, "link", "escape.txt")
 
 
 def _make_symlink(dest: Path, target: Path) -> None:

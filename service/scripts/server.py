@@ -54,6 +54,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from av_meta import clean_av, inspect_av
 from common import (
     MAX_INPUT_BYTES,
+    confined_path,
     eprint,
     looks_binary,
     subprocess_creationflags,
@@ -581,19 +582,6 @@ def _safe_name(name: str) -> str:
     return base
 
 
-def _tmp_path(tmpdir: Path, *parts: str) -> Path:
-    """Join *parts* under *tmpdir* and refuse anything that escapes it.
-
-    Defense-in-depth for the CodeQL "uncontrolled data in path expression"
-    findings: even if a caller slips a separator through, the write can never
-    land outside the request temp dir.
-    """
-    path = tmpdir.joinpath(*parts)
-    if path.parent != tmpdir:
-        raise ValueError("unsafe filename")
-    return path
-
-
 def _decode_input(body: dict[str, Any]) -> tuple[bytes, str]:
     raw = body.get("file")
     if not isinstance(raw, str):
@@ -678,7 +666,7 @@ def _inspect_payload(data: bytes, name: str, run_detect: bool) -> dict[str, Any]
             "suspicious": False,
         }
     with tempfile.TemporaryDirectory(prefix="wm-inspect-") as tmp:
-        path = _tmp_path(Path(tmp), name or "input")
+        path = confined_path(tmp, name or "input")
         path.write_bytes(data)
         if kind == "text":
             if looks_binary(data):
@@ -713,7 +701,7 @@ def _inspect_payload(data: bytes, name: str, run_detect: bool) -> dict[str, Any]
 def _detect_payload(data: bytes, name: str) -> dict[str, Any]:
     kind = classify_bytes(data, Path(name).suffix)
     with tempfile.TemporaryDirectory(prefix="wm-detect-") as tmp:
-        path = _tmp_path(Path(tmp), name or "input")
+        path = confined_path(tmp, name or "input")
         path.write_bytes(data)
         if kind == "text":
             if looks_binary(data):
@@ -768,7 +756,7 @@ def _clean_payload(data: bytes, name: str, options: dict[str, Any]) -> dict[str,
 
     with tempfile.TemporaryDirectory(prefix="wm-clean-") as tmp:
         tmpdir = Path(tmp)
-        src = _tmp_path(tmpdir, name or "input")
+        src = confined_path(tmpdir, name or "input")
         src.write_bytes(data)
         if kind == "text":
             if looks_binary(data):
@@ -799,7 +787,7 @@ def _clean_payload(data: bytes, name: str, options: dict[str, Any]) -> dict[str,
 
                 fmt_name = detect_format(data)
                 ext = f".{fmt_name}" if fmt_name != "unknown" else ".png"
-            dest = _tmp_path(tmpdir, f"out{ext}")
+            dest = confined_path(tmpdir, f"out{ext}")
             strip_all = not bool(options.get("keep_non_ai_metadata"))
             if "strip_all_metadata" in options:
                 strip_all = bool(options["strip_all_metadata"])
@@ -819,7 +807,7 @@ def _clean_payload(data: bytes, name: str, options: dict[str, Any]) -> dict[str,
             cleaned_bytes = dest.read_bytes()
             report = {"kind": "image", **result}
         elif kind == "av":
-            dest = _tmp_path(tmpdir, f"out{Path(name).suffix or '.bin'}")
+            dest = confined_path(tmpdir, f"out{Path(name).suffix or '.bin'}")
             strip_all = not bool(options.get("keep_non_ai_metadata"))
             if "strip_all_metadata" in options:
                 strip_all = bool(options["strip_all_metadata"])
@@ -845,7 +833,7 @@ def _clean_payload(data: bytes, name: str, options: dict[str, Any]) -> dict[str,
                     "markdown": ".md",
                 }
                 ext = ext_map.get(container_fmt, "")
-            dest = _tmp_path(tmpdir, f"out{ext}")
+            dest = confined_path(tmpdir, f"out{ext}")
             result = clean_container(
                 src,
                 dest,

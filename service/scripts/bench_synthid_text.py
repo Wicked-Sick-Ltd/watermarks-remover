@@ -48,7 +48,7 @@ from urllib.parse import urlparse
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from common import eprint, subprocess_creationflags  # noqa: E402
+from common import confined_path, eprint, subprocess_creationflags  # noqa: E402
 from detect_text_watermark import SCHEMES  # noqa: E402  (single source of scheme names)
 from rewrite_text import _lexical_divergence  # noqa: E402
 from text_unicode import clean_text  # noqa: E402
@@ -205,8 +205,8 @@ def run_watermark(
     config: str | None,
 ) -> dict[str, Any]:
     """Generate one watermarked (+ unwatermarked) sample via MarkLLM."""
-    wm_path = out_dir / f"wm_seed{seed}.txt"
-    plain_path = out_dir / f"plain_seed{seed}.txt"
+    wm_path = confined_path(out_dir, f"wm_seed{seed}.txt")
+    plain_path = confined_path(out_dir, f"plain_seed{seed}.txt")
     cmd = [
         python,
         str(script),
@@ -728,7 +728,7 @@ class Benchmark:
         total = len(self.corpus) * self.args.seeds
         done = 0
         for doc_id, prompt in self.corpus:
-            prompt_path = workdir / f"prompt_{doc_id}.txt"
+            prompt_path = confined_path(workdir, f"prompt_{doc_id}.txt")
             prompt_path.write_text(prompt, encoding="utf-8", errors="surrogateescape")
             for seed in range(self.args.seed_base, self.args.seed_base + self.args.seeds):
                 sample: dict[str, Any] = {
@@ -1312,7 +1312,7 @@ def main() -> int:
         ),
     }
 
-    workdir = out_dir / "work"
+    workdir = confined_path(out_dir, "work")
     workdir.mkdir(parents=True, exist_ok=True)
 
     eprint(f"corpus: {len(bench.corpus)} docs, {args.seeds} seed(s) each")
@@ -1378,12 +1378,12 @@ def main() -> int:
             )
         )
 
-    (out_dir / "report.md").write_text(report, encoding="utf-8")
-    (out_dir / "results.json").write_text(
+    confined_path(out_dir, "report.md").write_text(report, encoding="utf-8")
+    confined_path(out_dir, "results.json").write_text(
         json.dumps({"meta": config, "samples": samples, "rows": rows, "aggregates": agg}, indent=2),
         encoding="utf-8",
     )
-    (out_dir / "results.csv").write_text("\n".join(csv_lines) + "\n", encoding="utf-8")
+    confined_path(out_dir, "results.csv").write_text("\n".join(csv_lines) + "\n", encoding="utf-8")
 
     eprint("")
     eprint(f"results written to {out_dir}/")

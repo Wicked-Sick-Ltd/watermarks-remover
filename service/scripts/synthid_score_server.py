@@ -32,6 +32,7 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from common import confined_path
 from score_synthid import score_file
 
 VERSION = os.environ.get("WATERMARKS_SYNTHID_SERVER_VERSION", "dev")
@@ -127,7 +128,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         with tempfile.TemporaryDirectory(prefix="wm-synthid-") as tmp:
-            path = Path(tmp) / "input.png"
+            path = confined_path(tmp, "input.png")
             try:
                 path.write_bytes(data)
             except OSError as e:

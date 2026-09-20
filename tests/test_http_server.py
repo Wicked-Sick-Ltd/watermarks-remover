@@ -270,6 +270,29 @@ def test_safe_name_sanitizes_traversal():
     assert server._safe_name("report.docx") == "report.docx"
 
 
+def test_temp_name_never_carries_client_bytes():
+    """The temp filename is a fixed stem plus an allowlisted extension."""
+    assert server._temp_name("../../etc/passwd") == "input"
+    assert server._temp_name("../../notes.md") == "input.md"
+    assert server._temp_name("..\\..\\report.docx") == "input.docx"
+    assert server._temp_name("/abs/path/photo.PNG") == "input.png"
+    assert server._temp_name("payload.md\x00.png") == "input.png"
+    assert server._temp_name("noextension") == "input"
+    assert server._temp_name("") == "input"
+    # An unknown extension is dropped rather than carried into the path; the
+    # pipelines then route on magic bytes instead.
+    assert server._temp_name("thing.weird") == "input"
+
+
+def test_allowlisted_suffix_returns_allowlist_members_only():
+    from format_dispatch import KNOWN_EXTS, allowlisted_suffix
+
+    for name in ("../../x.md", "a.docx", "b.PNG", "c.mp4", "x.txt"):
+        assert allowlisted_suffix(name) in KNOWN_EXTS
+    assert allowlisted_suffix("no/such.ext") == ""
+    assert allowlisted_suffix("") == ""
+
+
 def test_traversal_name_does_not_escape(conn, tmp_path):
     data = "Hello\u200bWorld!".encode("utf-8")
     status, body = _post(conn, "/clean", {"file": _b64(data), "name": "../../escape.txt"})

@@ -245,11 +245,42 @@ def confined_path(root: str | Path, *parts: str | Path) -> Path:
     base = Path(root).resolve()
     if any(Path(part).is_absolute() for part in parts):
         raise ValueError("confined path parts must be relative")
-    candidate = base.joinpath(*parts).resolve()
+    # A NUL byte makes the containment check below moot: pathlib compares the
+    # whole string while the OS truncates at the NUL, so "in-root\x00/etc/passwd"
+    # would pass and then open a different file. Reject it before resolving.
+    if any("\x00" in str(part) for part in parts):
+        raise ValueError("confined path parts must not contain NUL")
+    return require_confined(base.joinpath(*parts), base)
+
+
+def require_confined(path: str | Path, root: str | Path) -> Path:
+    """Resolve *path* and return it, or raise if it escapes *root*.
+
+    Two independent containment checks on the resolved pair, because each
+    covers a case the other misses: ``relative_to`` is exact but purely
+    lexical, while ``os.path.commonpath`` additionally rejects a drive or UNC
+    mismatch on Windows. A sibling whose name merely starts with the root
+    ("/srv/outputs-evil" against root "/srv/outputs") fails both.
+
+    Separate from :func:`confined_path` so a caller holding an already-built
+    absolute path — one handed to it rather than joined from parts — can assert
+    confinement without re-deriving the path.
+    """
+    base = Path(root).resolve()
+    candidate = Path(path).resolve()
+    escaped = False
     try:
         candidate.relative_to(base)
     except ValueError:
-        raise ValueError(f"path escapes confined root: {candidate}") from None
+        escaped = True
+    try:
+        if Path(os.path.commonpath([str(base), str(candidate)])) != base:
+            escaped = True
+    except ValueError:
+        # Different drives / mixed absolute-relative: no common prefix exists.
+        escaped = True
+    if escaped:
+        raise ValueError(f"path escapes confined root: {candidate}")
     return candidate
 
 

@@ -23,6 +23,7 @@ from common import (
     backup_path,
     confined_path,
     read_text_input,
+    require_confined,
     safe_arg,
     safe_write_bytes,
     safe_write_text,
@@ -180,6 +181,37 @@ def test_confined_path_refuses_symlink_escape(tmp_path: Path):
     _make_symlink(root / "link", outside)
     with pytest.raises(ValueError, match="escapes"):
         confined_path(root, "link", "escape.txt")
+
+
+def test_confined_path_refuses_nul_byte(tmp_path: Path):
+    """pathlib compares the whole string, the OS truncates at the NUL."""
+    root = tmp_path / "sandbox"
+    root.mkdir()
+    with pytest.raises(ValueError, match="NUL"):
+        confined_path(root, "out.txt\x00/../../escape.txt")
+
+
+def test_require_confined_accepts_descendant(tmp_path: Path):
+    root = tmp_path / "sandbox"
+    (root / "nested").mkdir(parents=True)
+    assert require_confined(root / "nested" / "out.txt", root) == root.resolve() / "nested/out.txt"
+
+
+def test_require_confined_refuses_sibling_sharing_a_name_prefix(tmp_path: Path):
+    """A path like /x/sandbox-evil must not count as living under /x/sandbox."""
+    root = tmp_path / "sandbox"
+    root.mkdir()
+    sibling = tmp_path / "sandbox-evil"
+    sibling.mkdir()
+    with pytest.raises(ValueError, match="escapes"):
+        require_confined(sibling / "out.txt", root)
+
+
+def test_require_confined_refuses_parent(tmp_path: Path):
+    root = tmp_path / "sandbox"
+    root.mkdir()
+    with pytest.raises(ValueError, match="escapes"):
+        require_confined(tmp_path / "escape.txt", root)
 
 
 def _make_symlink(dest: Path, target: Path) -> None:

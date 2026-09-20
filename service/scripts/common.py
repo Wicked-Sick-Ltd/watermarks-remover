@@ -234,6 +234,25 @@ def write_text_output(text: str, path: str | None) -> None:
     safe_write_text(path, text)
 
 
+def confined_path(root: str | Path, *parts: str | Path) -> Path:
+    """Return a canonical path below *root*, rejecting traversal and symlink escapes.
+
+    The caller chooses the trusted output or temporary root.  Every appended
+    part must be relative, and the fully resolved result must remain under the
+    canonical root.  Resolving before the containment check also catches an
+    existing symlink that points outside the root.
+    """
+    base = Path(root).resolve()
+    if any(Path(part).is_absolute() for part in parts):
+        raise ValueError("confined path parts must be relative")
+    candidate = base.joinpath(*parts).resolve()
+    try:
+        candidate.relative_to(base)
+    except ValueError:
+        raise ValueError(f"path escapes confined root: {candidate}") from None
+    return candidate
+
+
 def _default_file_mode() -> int:
     """0o666 & ~umask — the mode a plain open() would produce."""
     mask = os.umask(0)

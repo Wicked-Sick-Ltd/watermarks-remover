@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import contextlib
 
 from audit_lib import aggregate, print_human_report, scan_file
-from common import EXIT_PARTIAL, emit_json, eprint
+from common import EXIT_PARTIAL, confined_path, emit_json, eprint
 
 DEFAULT_MAX_BYTES = 4 << 20
 DEFAULT_TIMEOUT = 15
@@ -446,7 +446,7 @@ def inspect_remote(url: str, data: bytes, content_type: str | None = None) -> di
     kind = guess_kind(url, data, content_type)
     ext = _EXT_FOR_KIND.get(kind, ".bin")
     with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td) / f"asset{ext}"
+        tmp = confined_path(td, f"asset{ext}")
         tmp.write_bytes(data)
         result = scan_file(tmp, display_name=url)
     result["kind"] = kind

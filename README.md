@@ -1376,3 +1376,15 @@ MIT — see [LICENSE](LICENSE).
 - [mertizci/noai-watermark](https://github.com/mertizci/noai-watermark) (CLI/Python toolkit for SynthID/StableSignature/TreeRing removal and AI metadata stripping)
 - [0xROOTPLS/DeSynth](https://github.com/0xROOTPLS/DeSynth) (SynthID removal for OpenAI/Google images)
 - Institute of AI PM, [*AI Content Provenance and Watermarking: The PM's Guide to C2PA and SynthID*](https://www.institutepm.com/knowledge-hub/ai-content-provenance-watermarking) (two-layer industry model: C2PA + imperceptible watermark / soft binding; SB 942 / EU AI Act Art. 50 context)
+
+<!-- repository-guidance:begin -->
+## Contributing and agent guidance
+
+- [Contributor guide](CONTRIBUTING.md): development workflow and validation.
+- [Agent instructions](AGENTS.md): shared guidance for Codex and other coding agents.
+- [Security policy](SECURITY.md): private vulnerability reporting.
+
+## Repository license
+
+MIT licensed; see [LICENSE](LICENSE). Preserve third-party notices.
+<!-- repository-guidance:end -->

@@ -22,9 +22,14 @@ tokenizers==0.23.2
 datasets==5.0.1
 accelerate==1.15.0
 SentencePiece==0.2.2
-# Latest PyPI release. Dependabot High GHSA-8mgp-746c-j5xp / CVE-2026-81726
-# still lists <=3.10.3 with no first_patched_version.
-nltk==3.10.3
+# GHSA-8mgp-746c-j5xp / CVE-2026-81726: GitHub Advisory Database still
+# lists nltk <=3.10.3 as affected and has no first_patched_version. PyPI's
+# latest release is 3.10.3 (3.10.3 source still uses builtin open() in
+# TransitionParser / AveragedPerceptron / save_maxent_params). NLTK develop
+# routes those model-artifact APIs through nltk.pathsec.open (PRs 3757,
+# 3759, 3813 and later GHSA-8mgp probes). Pin that patched commit until a
+# PyPI release outside the advisory range exists; then revert to a PyPI pin.
+nltk @ https://github.com/nltk/nltk/archive/46487d3488ac384bf6ae0a40083c1f071c8c4306.tar.gz#sha256=818f5cdf5ee30e4bf4deb1bbaeb457a057f5cbd8b668946c2db35090949ea5c8
 jieba==0.42.1
 tqdm==4.70.0
 matplotlib==3.11.1

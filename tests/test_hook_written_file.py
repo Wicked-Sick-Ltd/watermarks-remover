@@ -24,12 +24,31 @@ EXIT_HOOK_ERROR = 1
 EXIT_SHOW_MODEL = 2
 
 
-def run_hook(payload, *args: str, env: dict[str, str] | None = None):
+def run_hook(
+    payload,
+    *args: str,
+    env: dict[str, str] | None = None,
+    root: Path | str | None = None,
+    cwd: Path | None = None,
+):
     full_env = os.environ.copy()
     # Both mode sources have to be cleared, or an ambient plugin option would
-    # silently decide what mode these tests exercise.
-    full_env.pop("WATERMARKS_HOOK_MODE", None)
-    full_env.pop("CLAUDE_PLUGIN_OPTION_HOOK_MODE", None)
+    # silently decide what mode these tests exercise. Likewise both root
+    # sources, so the confinement root is always the one a test chose.
+    for var in (
+        "WATERMARKS_HOOK_MODE",
+        "CLAUDE_PLUGIN_OPTION_HOOK_MODE",
+        "WATERMARKS_HOOK_ROOT",
+        "CLAUDE_PROJECT_DIR",
+    ):
+        full_env.pop(var, None)
+    # The hook only touches files under its allowlisted root. Tests write into
+    # tmp_path while running from the repo, so the root has to be passed; the
+    # payload's cwd (the harness's project dir) is the natural stand-in.
+    if root is None and isinstance(payload, dict):
+        root = payload.get("cwd")
+    if root is not None:
+        full_env["WATERMARKS_HOOK_ROOT"] = str(root)
     full_env.update(env or {})
     return subprocess.run(
         [sys.executable, str(HOOK), *args],
@@ -38,6 +57,7 @@ def run_hook(payload, *args: str, env: dict[str, str] | None = None):
         encoding="utf-8",
         capture_output=True,
         env=full_env,
+        cwd=cwd,
         check=False,
     )
 
@@ -155,16 +175,31 @@ def test_clean_does_not_leave_temp_files_behind(marked_file):
 # --------------------------------------------------------------------------
 
 
-def test_relative_file_path_resolves_against_the_payload_cwd(marked_file):
+def test_relative_file_path_resolves_against_the_hook_root(marked_file):
+    payload = {
+        "tool_name": "Edit",
+        "tool_input": {"file_path": marked_file.name},
+    }
+
+    result = run_hook(payload, root=marked_file.parent)
+
+    assert result.returncode == EXIT_SHOW_MODEL
+
+
+def test_relative_file_path_is_not_anchored_at_the_payload_cwd(marked_file, tmp_path_factory):
+    # The payload's cwd is chosen by the same caller as file_path, so it must
+    # not pick where a relative path lands. Root elsewhere -> nothing to scan.
+    root = tmp_path_factory.mktemp("project")
     payload = {
         "tool_name": "Edit",
         "tool_input": {"file_path": marked_file.name},
         "cwd": str(marked_file.parent),
     }
 
-    result = run_hook(payload)
+    result = run_hook(payload, root=root)
 
-    assert result.returncode == EXIT_SHOW_MODEL
+    assert result.returncode == EXIT_QUIET
+    assert result.stdout == ""
 
 
 def test_notebook_edit_payload_uses_notebook_path(marked_file):
@@ -220,6 +255,143 @@ def test_malformed_payload_reports_once_without_a_traceback(payload):
     assert result.returncode == EXIT_HOOK_ERROR
     assert "Traceback" not in result.stderr
     assert len(result.stderr.strip().splitlines()) == 1
+
+
+# --------------------------------------------------------------------------
+# confinement: the payload is untrusted, so only files under the root count
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def outside_file(tmp_path_factory) -> Path:
+    """A marked file in a directory that is never the hook root."""
+    path = tmp_path_factory.mktemp("elsewhere") / "secret.md"
+    path.write_bytes(MARKED.read_bytes())
+    return path
+
+
+@pytest.mark.parametrize("mode", ["check", "clean"])
+def test_file_outside_the_root_is_skipped_and_left_untouched(tmp_path, outside_file, mode):
+    before = outside_file.read_bytes()
+
+    result = run_hook(write_event(outside_file), "--mode", mode, root=tmp_path)
+
+    assert result.returncode == EXIT_QUIET
+    assert result.stdout == ""
+    assert "outside" in result.stderr
+    assert outside_file.read_bytes() == before
+
+
+def test_traversal_out_of_the_root_is_skipped(tmp_path, outside_file):
+    # A lexical child of the root that climbs back out of it.
+    climb = Path(os.path.relpath(outside_file, tmp_path))
+    assert ".." in climb.parts
+    payload = {"tool_name": "Write", "tool_input": {"file_path": str(climb)}}
+
+    result = run_hook(payload, root=tmp_path)
+
+    assert result.returncode == EXIT_QUIET
+    assert result.stdout == ""
+    assert "outside" in result.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation needs a privilege on Windows")
+def test_symlink_inside_the_root_pointing_outside_is_skipped(tmp_path, outside_file):
+    link = tmp_path / "innocent.md"
+    link.symlink_to(outside_file)
+    before = outside_file.read_bytes()
+
+    result = run_hook(write_event(link), "--mode", "clean", root=tmp_path)
+
+    assert result.returncode == EXIT_QUIET
+    assert "outside" in result.stderr
+    assert outside_file.read_bytes() == before
+    assert link.is_symlink()
+
+
+def test_nul_byte_in_the_path_is_skipped(tmp_path, marked_file):
+    payload = {
+        "tool_name": "Write",
+        "tool_input": {"file_path": f"{marked_file}\x00/../../etc/passwd"},
+    }
+
+    result = run_hook(payload, root=tmp_path)
+
+    assert result.returncode == EXIT_QUIET
+    assert result.stdout == ""
+    assert "Traceback" not in result.stderr
+    assert "NUL" in result.stderr
+
+
+def test_root_defaults_to_the_hooks_working_directory(marked_file):
+    # Claude Code runs hooks from the project directory, so with nothing
+    # configured that directory is the root.
+    payload = {"tool_name": "Write", "tool_input": {"file_path": str(marked_file)}}
+
+    inside = run_hook(payload, root=None, cwd=marked_file.parent)
+    elsewhere = run_hook(payload, root=None, cwd=ROOT)
+
+    assert inside.returncode == EXIT_SHOW_MODEL
+    assert elsewhere.returncode == EXIT_QUIET
+    assert "outside" in elsewhere.stderr
+
+
+def test_claude_project_dir_is_honoured_as_the_root(marked_file, tmp_path_factory):
+    payload = {"tool_name": "Write", "tool_input": {"file_path": str(marked_file)}}
+
+    matching = run_hook(payload, root=None, env={"CLAUDE_PROJECT_DIR": str(marked_file.parent)})
+    other = run_hook(
+        payload, root=None, env={"CLAUDE_PROJECT_DIR": str(tmp_path_factory.mktemp("other"))}
+    )
+
+    assert matching.returncode == EXIT_SHOW_MODEL
+    assert other.returncode == EXIT_QUIET
+
+
+def test_explicit_root_overrides_claude_project_dir(marked_file, tmp_path_factory):
+    payload = {"tool_name": "Write", "tool_input": {"file_path": str(marked_file)}}
+
+    result = run_hook(
+        payload,
+        root=marked_file.parent,
+        env={"CLAUDE_PROJECT_DIR": str(tmp_path_factory.mktemp("other"))},
+    )
+
+    assert result.returncode == EXIT_SHOW_MODEL
+
+
+def test_file_in_a_subdirectory_of_the_root_is_in_scope(tmp_path):
+    nested = tmp_path / "docs" / "deep" / "draft.md"
+    nested.parent.mkdir(parents=True)
+    nested.write_bytes(MARKED.read_bytes())
+
+    result = run_hook(write_event(nested), root=tmp_path)
+
+    assert result.returncode == EXIT_SHOW_MODEL
+
+
+def test_target_path_confines_directly(tmp_path, outside_file):
+    sys.path.insert(0, str(ROOT / "service" / "scripts"))
+    import hook_written_file
+
+    root = tmp_path.resolve()
+    inside = tmp_path / "ok.md"
+    inside.write_text("x", encoding="utf-8")
+
+    def event(raw: str) -> dict:
+        return {"tool_name": "Write", "tool_input": {"file_path": raw}}
+
+    assert hook_written_file.target_path(event(str(inside)), root) == inside.resolve()
+    assert hook_written_file.target_path(event("ok.md"), root) == inside.resolve()
+    assert hook_written_file.target_path({"tool_name": "Bash"}, root) is None
+    for escape in (
+        str(outside_file),
+        f"../{outside_file.parent.name}/{outside_file.name}",
+        f"{root}-evil/ok.md",
+        "ok.md\x00",
+    ):
+        with pytest.raises(hook_written_file.OutsideRoot):
+            hook_written_file.target_path(event(escape), root)
 
 
 def test_oversized_file_is_skipped_rather_than_scanned(tmp_path, marked_file):

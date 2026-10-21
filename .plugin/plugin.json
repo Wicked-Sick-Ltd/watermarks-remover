@@ -1,0 +1,24 @@
+{
+  "name": "watermarks-remover",
+  "version": "0.5.0",
+  "description": "Remove multi-vendor AI provenance marks: invisible Unicode (Layer A), statistical text watermarks via rewrite (Layer B), and C2PA/EXIF/XMP/container metadata on images, documents, and media.",
+  "author": {
+    "name": "watermarks-remover contributors",
+    "url": "https://github.com/Wicked-Sick-Ltd/watermarks-remover"
+  },
+  "homepage": "https://github.com/Wicked-Sick-Ltd/watermarks-remover#readme",
+  "repository": "https://github.com/Wicked-Sick-Ltd/watermarks-remover",
+  "license": "MIT",
+  "keywords": [
+    "watermark",
+    "c2pa",
+    "content-credentials",
+    "provenance",
+    "metadata",
+    "unicode",
+    "synthid",
+    "ai-detection"
+  ],
+  "skills": "./skills",
+  "hooks": {}
+}

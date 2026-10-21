@@ -1,0 +1,16 @@
+{
+  "watermarks-remover": {
+    "PostToolUse": [
+      {
+        "matcher": "write_file|edit_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 service/scripts/hook_written_file.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -4,6 +4,15 @@
 /*
 !/.claude-plugin/
 !/.claude-plugin/**
+!/.codex-plugin/
+!/.codex-plugin/**
+!/.cursor-plugin/
+!/.cursor-plugin/**
+!/.plugin/
+!/.plugin/**
+!/plugin.json
+!/hooks.json
+!/gemini-extension.json
 !/hooks/
 !/hooks/**
 !/.github/

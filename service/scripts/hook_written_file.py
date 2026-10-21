@@ -52,7 +52,15 @@ ROOT_ENV_VARS = ("WATERMARKS_HOOK_ROOT", "CLAUDE_PROJECT_DIR")
 
 # Tools whose payload names a single file the agent just wrote. The hook
 # matcher should filter these too; this is the defensive second check.
-FILE_WRITING_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit", "Update"})
+FILE_WRITING_TOOLS = frozenset({
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "Update",
+    "write_file",
+    "edit_file",
+})
 
 MODES = ("check", "clean")
 DEFAULT_MODE = "check"
@@ -116,13 +124,22 @@ def target_path(payload: dict, root: Path) -> Path | None:
     byte, a traversal segment, an absolute path elsewhere, or a symlink that
     resolves outside the root. A relative path is anchored at the root.
     """
-    if payload.get("tool_name") not in FILE_WRITING_TOOLS:
+    tool_call = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
+    tool_name = payload.get("tool_name") or tool_call.get("name")
+    if tool_name not in FILE_WRITING_TOOLS:
         return None
 
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
+        tool_input = tool_call.get("args")
+    if not isinstance(tool_input, dict):
         return None
-    raw = tool_input.get("file_path") or tool_input.get("notebook_path")
+    raw = (
+        tool_input.get("file_path")
+        or tool_input.get("notebook_path")
+        or tool_input.get("Path")
+        or tool_input.get("TargetFile")
+    )
     if not isinstance(raw, str) or not raw.strip():
         return None
     if "\x00" in raw:
@@ -276,6 +293,7 @@ def main(argv: list[str] | None = None) -> int:
         eprint("watermarks-remover: hook payload was not a JSON object")
         return EXIT_HOOK_ERROR
 
+    is_antigravity = isinstance(payload.get("toolCall"), dict) and "tool_name" not in payload
     root = hook_root()
     try:
         path = target_path(payload, root)
@@ -283,18 +301,32 @@ def main(argv: list[str] | None = None) -> int:
         # Not the hook's file to touch. Quiet on the harness side (exit 0),
         # with the reason on stderr for anyone debugging a skipped file.
         eprint(f"watermarks-remover: skipping file outside {root}: {error}")
+        if is_antigravity:
+            print("{}")
         return EXIT_QUIET
     if path is None or not path.is_file():
+        if is_antigravity:
+            print("{}")
         return EXIT_QUIET
     if path.stat().st_size > MAX_INPUT_BYTES:
+        if is_antigravity:
+            print("{}")
         return EXIT_QUIET
 
     mode = resolve_mode(args.mode)
     try:
-        return run_clean(path) if mode == "clean" else run_check(path)
+        rc = run_clean(path) if mode == "clean" else run_check(path)
+        if is_antigravity:
+            if rc == EXIT_QUIET:
+                print("{}")
+            return EXIT_QUIET
+        return rc
     except OSError as error:
         # A hook must never take the session down with it.
         eprint(f"watermarks-remover: hook failed on {path}: {error}")
+        if is_antigravity:
+            print("{}")
+            return EXIT_QUIET
         return EXIT_HOOK_ERROR
 
 

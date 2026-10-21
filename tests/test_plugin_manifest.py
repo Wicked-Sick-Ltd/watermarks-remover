@@ -152,3 +152,29 @@ def test_hook_command_never_substitutes_an_unset_plugin_option(hooks):
         for hook in entry["hooks"]:
             rendered = json.dumps([hook.get("command"), *hook.get("args", [])])
             assert "user_config" not in rendered
+
+
+def test_multi_vendor_plugin_manifests_agree_and_install_targets_resolve(plugin, tmp_path):
+    for rel in (
+        "plugin.json",
+        "gemini-extension.json",
+        ".codex-plugin/plugin.json",
+        ".cursor-plugin/plugin.json",
+        ".plugin/plugin.json",
+    ):
+        manifest = json.loads((ROOT / rel).read_text(encoding="utf-8"))
+        assert manifest["name"] == plugin["name"]
+        assert manifest["version"] == plugin["version"]
+
+    agy_hooks = json.loads((ROOT / "hooks.json").read_text(encoding="utf-8"))
+    assert "PostToolUse" in agy_hooks["watermarks-remover"]
+
+    sys.path.insert(0, str(ROOT))
+    import install_skill
+
+    for target in ("codex", "gemini", "antigravity", "copilot", "grok", "agents", "agents-project"):
+        args = install_skill.build_parser().parse_args(
+            ["--target", target, "--project-dir", str(tmp_path)]
+        )
+        dest = install_skill.destination_for(args, "clean-user-facing-text")
+        assert dest.name == "clean-user-facing-text"

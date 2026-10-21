@@ -10,7 +10,7 @@
 # noai-watermark commit after bumps: released diffusers 0.40.0 requires
 # huggingface_hub>=1.23.0 and transformers 5.x (tokenizers>=0.23.1).
 # accelerate tracks the Dependabot pip group (1.15.0).
-# Pillow stays 12.3.0 (not in the High pip set).
+# Pillow stays 13.0.0 (aligned with requirements-synthid-scorer.txt).
 #
 # This file is only ever installed inside the dedicated venv created by
 # setup_ctrlregen.sh (service profile "ctrlregen"), never into the main
@@ -29,5 +29,5 @@ tokenizers==0.23.2
 # requirements-markllm.txt so the /service/scripts pip ecosystem shares one
 # hub pin.
 huggingface_hub==1.27.0
-Pillow==12.3.0
+Pillow==13.0.0
 piexif==1.1.3

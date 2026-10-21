@@ -319,6 +319,33 @@ def destination_for(args: argparse.Namespace, skill: str) -> Path:
     if args.target == "claude-project":
         project = Path(args.project_dir or Path.cwd()).expanduser().resolve()
         return project / ".claude" / "skills" / skill
+    if args.target == "codex":
+        return (
+            _home(getattr(args, "codex_home", None), "CODEX_HOME", home / ".codex")
+            / "skills"
+            / skill
+        )
+    if args.target in ("gemini", "antigravity"):
+        return (
+            _home(getattr(args, "gemini_home", None), "GEMINI_HOME", home / ".gemini" / "config")
+            / "skills"
+            / skill
+        )
+    if args.target == "copilot":
+        return (
+            _home(getattr(args, "copilot_home", None), "COPILOT_HOME", home / ".copilot")
+            / "skills"
+            / skill
+        )
+    if args.target == "grok":
+        return (
+            _home(getattr(args, "grok_home", None), "GROK_HOME", home / ".grok") / "skills" / skill
+        )
+    if args.target == "agents":
+        return home / ".agents" / "skills" / skill
+    if args.target == "agents-project":
+        project = Path(args.project_dir or Path.cwd()).expanduser().resolve()
+        return project / ".agents" / "skills" / skill
     raise SkillError(f"target {args.target} does not install into a directory")
 
 
@@ -331,6 +358,13 @@ HOST_HINTS = {
         "Claude Code loads project skills from .claude/skills in the working directory "
         "and its parents. Commit the directory to share it (cloud sessions read it too)."
     ),
+    "codex": "Codex loads personal skills from ~/.codex/skills and project skills from .agents/skills.",
+    "gemini": "Google Antigravity and Gemini load skills from ~/.gemini/config/skills and .agents/skills.",
+    "antigravity": "Google Antigravity loads skills from ~/.gemini/config/skills and .agents/skills.",
+    "copilot": "GitHub Copilot CLI loads skills from ~/.copilot/skills and .agents/skills.",
+    "grok": "Grok Build loads skills from ~/.grok/skills and .agents/skills.",
+    "agents": "Universal Agent Skills directory (~/.agents/skills) shared across Codex, Gemini, Copilot, and Cursor.",
+    "agents-project": "Project-scoped .agents/skills directory shared across Codex, Gemini, Copilot, and Cursor.",
 }
 
 
@@ -347,7 +381,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--target",
         default=DEFAULT_TARGET,
-        choices=("cursor", "claude-code", "claude-project", "cowork"),
+        choices=(
+            "cursor",
+            "claude-code",
+            "claude-project",
+            "cowork",
+            "codex",
+            "gemini",
+            "antigravity",
+            "copilot",
+            "grok",
+            "agents",
+            "agents-project",
+        ),
         help=f"Where to install (default: {DEFAULT_TARGET})",
     )
     parser.add_argument("--list", action="store_true", help="List available skills and exit")
@@ -424,6 +470,13 @@ def main(argv: list[str] | None = None) -> int:
         "cursor": "Cursor",
         "claude-code": "Claude Code",
         "claude-project": "Claude Code (project)",
+        "codex": "Codex",
+        "gemini": "Google Antigravity / Gemini",
+        "antigravity": "Google Antigravity",
+        "copilot": "GitHub Copilot",
+        "grok": "Grok Build",
+        "agents": "Agent Skills (~/.agents)",
+        "agents-project": "Agent Skills (.agents)",
     }[args.target]
     if backup is not None:
         print(f"{label}: backed up existing skill to {backup}")

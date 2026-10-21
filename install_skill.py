@@ -320,13 +320,27 @@ def destination_for(args: argparse.Namespace, skill: str) -> Path:
         project = Path(args.project_dir or Path.cwd()).expanduser().resolve()
         return project / ".claude" / "skills" / skill
     if args.target == "codex":
-        return _home(getattr(args, "codex_home", None), "CODEX_HOME", home / ".codex") / "skills" / skill
+        return (
+            _home(getattr(args, "codex_home", None), "CODEX_HOME", home / ".codex")
+            / "skills"
+            / skill
+        )
     if args.target in ("gemini", "antigravity"):
-        return _home(getattr(args, "gemini_home", None), "GEMINI_HOME", home / ".gemini" / "config") / "skills" / skill
+        return (
+            _home(getattr(args, "gemini_home", None), "GEMINI_HOME", home / ".gemini" / "config")
+            / "skills"
+            / skill
+        )
     if args.target == "copilot":
-        return _home(getattr(args, "copilot_home", None), "COPILOT_HOME", home / ".copilot") / "skills" / skill
+        return (
+            _home(getattr(args, "copilot_home", None), "COPILOT_HOME", home / ".copilot")
+            / "skills"
+            / skill
+        )
     if args.target == "grok":
-        return _home(getattr(args, "grok_home", None), "GROK_HOME", home / ".grok") / "skills" / skill
+        return (
+            _home(getattr(args, "grok_home", None), "GROK_HOME", home / ".grok") / "skills" / skill
+        )
     if args.target == "agents":
         return home / ".agents" / "skills" / skill
     if args.target == "agents-project":

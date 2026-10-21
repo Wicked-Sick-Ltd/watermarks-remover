@@ -52,15 +52,17 @@ ROOT_ENV_VARS = ("WATERMARKS_HOOK_ROOT", "CLAUDE_PROJECT_DIR")
 
 # Tools whose payload names a single file the agent just wrote. The hook
 # matcher should filter these too; this is the defensive second check.
-FILE_WRITING_TOOLS = frozenset({
-    "Write",
-    "Edit",
-    "MultiEdit",
-    "NotebookEdit",
-    "Update",
-    "write_file",
-    "edit_file",
-})
+FILE_WRITING_TOOLS = frozenset(
+    {
+        "Write",
+        "Edit",
+        "MultiEdit",
+        "NotebookEdit",
+        "Update",
+        "write_file",
+        "edit_file",
+    }
+)
 
 MODES = ("check", "clean")
 DEFAULT_MODE = "check"

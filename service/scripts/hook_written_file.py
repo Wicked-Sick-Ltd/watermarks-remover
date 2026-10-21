@@ -61,6 +61,9 @@ FILE_WRITING_TOOLS = frozenset(
         "Update",
         "write_file",
         "edit_file",
+        "write_to_file",
+        "replace_file_content",
+        "multi_replace_file_content",
     }
 )
 
@@ -159,6 +162,11 @@ def target_path(payload: dict, root: Path) -> Path | None:
         raise OutsideRoot(f"cannot resolve {raw!r}: {error}") from None
 
 
+# Mutable flag so _emit can mark that stdout already holds a JSON object
+# without a ``global`` statement (ruff PLW0603).
+_stdout_state = {"emitted": False}
+
+
 def _emit(system_message: str, additional_context: str | None = None) -> None:
     """Print the PostToolUse JSON the harness reads from stdout."""
     output: dict[str, object] = {
@@ -168,6 +176,7 @@ def _emit(system_message: str, additional_context: str | None = None) -> None:
     if additional_context:
         output["additionalContext"] = additional_context
     print(json.dumps(output))
+    _stdout_state["emitted"] = True
 
 
 def run_check(path: Path) -> int:
@@ -272,6 +281,8 @@ def _describe(result: dict) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _stdout_state["emitted"] = False
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
@@ -319,7 +330,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         rc = run_clean(path) if mode == "clean" else run_check(path)
         if is_antigravity:
-            if rc == EXIT_QUIET:
+            if rc == EXIT_QUIET and not _stdout_state["emitted"]:
                 print("{}")
             return EXIT_QUIET
         return rc

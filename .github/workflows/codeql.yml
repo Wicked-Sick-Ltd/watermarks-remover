@@ -1,28 +1,29 @@
+# DISABLED 2026-11-05 (Wicked fleet CodeQL schedule triage)
+#
+# Why: GitHub Code Scanning *default setup* is enabled on this repository.
+# Advanced setup workflows cannot upload SARIF while default setup is on —
+# scheduled runs fail with:
+#   "CodeQL analyses from advanced configurations cannot be processed when
+#    the default setup is enabled"
+# Evidence: Wicked-Sick-Ltd/<repo> Actions → CodeQL (schedule) ≥2 consecutive
+# failures, last ~2026-11-02. Default CodeQL (dynamic/github-code-scanning)
+# remains configured + green; Dependabot and other security lanes untouched.
+#
+# Re-enable this advanced workflow only AFTER disabling default setup
+# (Settings → Code security → Code scanning), if a custom build matrix is
+# required. Until then keep triggers inert so the schedule stops failing.
 name: CodeQL
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-  schedule:
-    - cron: "23 3 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
-  # Required for CodeQL to upload SARIF results.
-  security-events: write
 
 jobs:
   analyze:
+    name: Analyze (disabled — default setup active)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        language: [python]
+    if: false
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: github/codeql-action/init@c16c0f3f2812ec4bb3750a5ed64873fe2ce0fbef # codeql-bundle-v2.26.3
-        with:
-          languages: ${{ matrix.language }}
-      - uses: github/codeql-action/analyze@c16c0f3f2812ec4bb3750a5ed64873fe2ce0fbef # codeql-bundle-v2.26.3
+      - run: echo "Advanced CodeQL disabled; default setup owns scanning."

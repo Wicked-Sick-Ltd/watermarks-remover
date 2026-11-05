@@ -18,15 +18,15 @@
 # exposed to untrusted input on the network path. Keep it that way: do not
 # merge these pins into the core requirements or the Docker images, and
 # run a scoped pip-audit against this file if you need a report.
-diffusers==0.27.2
-transformers==4.37.2
+diffusers==0.38.0
+transformers==5.10.1
 accelerate==1.15.0
 controlnet-aux==0.0.10
 color-matcher==0.6.0
 safetensors==0.8.0
-# huggingface_hub must stay <=0.25.0: 0.26.0+ removed the cached_download
-# symbol that diffusers 0.27.2 still imports. Unpinned, pip resolves latest
-# (0.36.2) and the backend fails to import.
-huggingface_hub==0.24.0
+# transformers 5.10.1 requires huggingface_hub>=1.5.0,<2.0 (diffusers 0.38.0
+# requires >=0.34.0,<2.0). 1.5.0 is the latest patch on that floor. The old
+# <=0.25.0 ceiling applied only to diffusers 0.27.2's cached_download import.
+huggingface_hub==1.5.0
 Pillow==13.0.0
 piexif==1.1.3

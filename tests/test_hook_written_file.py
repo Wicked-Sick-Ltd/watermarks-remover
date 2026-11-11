@@ -301,6 +301,21 @@ def test_traversal_out_of_the_root_is_skipped(tmp_path):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="symlink creation needs a privilege on Windows")
+def test_in_root_symlink_keeps_the_link_suffix_for_dispatch(tmp_path):
+    # draft.txt -> blob (no extension). Resolving would classify the target as
+    # unknown and skip the marks. The hook must keep the name the tool wrote.
+    blob = tmp_path / "blob"
+    blob.write_bytes(MARKED.read_bytes())
+    link = tmp_path / "draft.txt"
+    link.symlink_to(blob)
+
+    result = run_hook(write_event(link), root=tmp_path)
+
+    assert result.returncode == EXIT_SHOW_MODEL
+    assert "U+200B" in result.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation needs a privilege on Windows")
 def test_symlink_inside_the_root_pointing_outside_is_skipped(tmp_path):
     outside = tmp_path / "secret.md"
     outside.write_bytes(MARKED.read_bytes())

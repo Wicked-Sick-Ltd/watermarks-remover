@@ -118,9 +118,10 @@ def target_path(payload: dict, root: Path) -> Path | None:
     byte, a traversal segment, an absolute path elsewhere, or a symlink that
     resolves outside the root. A relative path is anchored at the root.
 
-    The returned path is the one the tool named, not the symlink target.
-    Dispatch uses that suffix. The resolved target is still required to stay
-    under *root* before this returns.
+    The returned path keeps the name the tool wrote, so dispatch still sees
+    that suffix, but both that directory entry and its symlink target have to
+    sit under *root*. A symlink that lives outside the root and only points
+    in is rejected: cleaning would otherwise replace it from outside.
     """
     if payload.get("tool_name") not in FILE_WRITING_TOOLS:
         return None
@@ -141,17 +142,26 @@ def target_path(payload: dict, root: Path) -> Path | None:
         # Joined only to the trusted root, then require_confined rejects escapes.
         path = root / path  # nosemgrep: tainted-path-traversal-stdlib
     try:
-        # Confirm the resolved target stays under the root, but return the
-        # path the tool named. Dispatch keys off that suffix; resolving
-        # `draft.txt -> blob` would classify the extensionless target as
-        # unknown and skip a marked text file.
-        require_confined(path, root)
+        # The directory entry itself must live under the root. Resolving the
+        # whole path would follow a symlink that sits outside and only points
+        # in, and clean mode would then replace that outside symlink.
+        parent = path.parent.resolve()
+        base = root.resolve()
+        if parent != base and base not in parent.parents:
+            raise OutsideRoot("file path is outside the hook root")
+        if path.name in ("", ".", ".."):
+            raise OutsideRoot("file path is outside the hook root")
+        located = parent / path.name
+        # The opened target, including a final symlink, must also stay inside.
+        require_confined(located, base)
+    except OutsideRoot:
+        raise
     except ValueError as error:
         raise OutsideRoot(str(error)) from None
     except (OSError, RuntimeError) as error:
         # resolve() failed: a symlink loop, or a component we cannot stat.
         raise OutsideRoot(f"cannot resolve {raw!r}: {error}") from None
-    return path
+    return located
 
 
 def _emit(system_message: str, additional_context: str | None = None) -> None:

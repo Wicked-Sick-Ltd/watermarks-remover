@@ -316,6 +316,25 @@ def test_in_root_symlink_keeps_the_link_suffix_for_dispatch(tmp_path):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="symlink creation needs a privilege on Windows")
+def test_symlink_outside_the_root_pointing_inside_is_not_replaced(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    inside = root / "file.txt"
+    inside.write_bytes(MARKED.read_bytes())
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = outside / "draft.txt"
+    link.symlink_to(inside)
+    before = inside.read_bytes()
+
+    result = run_hook(write_event(link), "--mode", "clean", root=root)
+
+    assert result.returncode == EXIT_QUIET
+    assert link.is_symlink()
+    assert inside.read_bytes() == before
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation needs a privilege on Windows")
 def test_symlink_inside_the_root_pointing_outside_is_skipped(tmp_path):
     outside = tmp_path / "secret.md"
     outside.write_bytes(MARKED.read_bytes())

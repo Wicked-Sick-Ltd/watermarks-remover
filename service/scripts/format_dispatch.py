@@ -125,10 +125,20 @@ TEXT_EXTS = {
     ".tsv",
 }
 
+# Audio-only names that clean_audio.AUDIO_EXTS routes but that are not in
+# AV_EXTS (classification still sniffs those). They have to stay in the
+# allowlist or /clean stages them as "input" / "out.bin" and the audio chain
+# no longer sees .aac / .ogg / .opus.
+_AUDIO_NAME_EXTS = {".aac", ".ogg", ".opus"}
+
 #: Every extension the pipelines route on. Longest first so ".markdown" wins
 #: over a shorter suffix that is also in the set.
 KNOWN_EXTS: tuple[str, ...] = tuple(
-    sorted(IMAGE_EXTS | CONTAINER_EXTS | TEXT_EXTS | AV_EXTS, key=len, reverse=True)
+    sorted(
+        IMAGE_EXTS | CONTAINER_EXTS | TEXT_EXTS | AV_EXTS | _AUDIO_NAME_EXTS,
+        key=len,
+        reverse=True,
+    )
 )
 
 

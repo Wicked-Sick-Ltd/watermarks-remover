@@ -475,6 +475,9 @@ def test_temp_name_never_carries_client_bytes():
     assert server._temp_name("noextension") == "input"
     assert server._temp_name("") == "input"
     assert server._temp_name("thing.weird") == "input"
+    assert server._temp_name("clip.aac") == "input.aac"
+    assert server._temp_name("clip.ogg") == "input.ogg"
+    assert server._temp_name("clip.opus") == "input.opus"
 
 
 def test_allowlisted_suffix_returns_allowlist_members_only():

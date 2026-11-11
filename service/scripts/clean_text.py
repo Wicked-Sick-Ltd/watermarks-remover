@@ -74,13 +74,15 @@ def main() -> int:
         if args.path in (None, "-"):
             eprint("--in-place requires a file path")
             return 2
-        src = Path(args.path)
+        # CLI opens the file the user named; no extra concatenation.
+        src = Path(args.path)  # nosemgrep: tainted-path-traversal-stdlib
         bak, created = backup_path(src)
         if not created:
             eprint(f"backup {bak} already exists from an earlier run; keeping the original backup")
         out = str(src)
     elif out is None and args.path not in (None, "-"):
-        out = str(cleaned_path(Path(args.path)))
+        # output name stays beside the file the user named.
+        out = str(cleaned_path(Path(args.path)))  # nosemgrep: tainted-path-traversal-stdlib
 
     write_text_output(cleaned, out)
 

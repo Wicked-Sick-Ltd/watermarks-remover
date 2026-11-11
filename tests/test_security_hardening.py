@@ -22,7 +22,9 @@ import common
 import container_meta
 from common import (
     backup_path,
+    confined_path,
     read_text_input,
+    require_confined,
     safe_arg,
     safe_write_bytes,
     safe_write_text,
@@ -537,3 +539,40 @@ def test_inspect_png_over_budget_chunk_does_not_skip_later_chunks(monkeypatch):
     assert has_ai is True
     assert any("exceeds cap" in f for f in findings)
     assert any("ChatGPT" in f for f in findings)
+
+
+def test_confined_path_canonicalizes_child_under_root(tmp_path: Path):
+    root = tmp_path / "sandbox"
+    root.mkdir()
+    assert confined_path(root, "nested", "..", "out.txt") == root.resolve() / "out.txt"
+
+
+@pytest.mark.parametrize("child", ("../escape.txt", "../../escape.txt"))
+def test_confined_path_refuses_parent_traversal(tmp_path: Path, child: str):
+    root = tmp_path / "sandbox"
+    root.mkdir()
+    with pytest.raises(ValueError, match="escapes"):
+        confined_path(root, child)
+
+
+def test_confined_path_refuses_absolute_child(tmp_path: Path):
+    root = tmp_path / "sandbox"
+    root.mkdir()
+    with pytest.raises(ValueError, match="relative"):
+        confined_path(root, tmp_path / "escape.txt")
+
+
+def test_confined_path_refuses_nul_byte(tmp_path: Path):
+    root = tmp_path / "sandbox"
+    root.mkdir()
+    with pytest.raises(ValueError, match="NUL"):
+        confined_path(root, "out.txt\x00/../../escape.txt")
+
+
+def test_require_confined_refuses_sibling_sharing_a_name_prefix(tmp_path: Path):
+    root = tmp_path / "sandbox"
+    root.mkdir()
+    sibling = tmp_path / "sandbox-evil"
+    sibling.mkdir()
+    with pytest.raises(ValueError, match="escapes"):
+        require_confined(sibling / "out.txt", root)

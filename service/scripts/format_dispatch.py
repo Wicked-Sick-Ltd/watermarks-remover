@@ -125,6 +125,40 @@ TEXT_EXTS = {
     ".tsv",
 }
 
+#: Every extension the pipelines route on. Longest first so ".markdown" wins
+#: over a shorter suffix that is also in the set.
+KNOWN_EXTS: tuple[str, ...] = tuple(
+    sorted(IMAGE_EXTS | CONTAINER_EXTS | TEXT_EXTS | AV_EXTS, key=len, reverse=True)
+)
+
+
+def allowlisted_suffix(name: str) -> str:
+    """Return *name*'s extension as one of :data:`KNOWN_EXTS`, or ``""``.
+
+    The return value is always an element of the allowlist rather than a slice
+    of *name*, so a caller can build a filesystem path from it without any
+    untrusted byte reaching the path. Traversal segments, absolute prefixes,
+    NUL bytes and Windows separators cannot survive a comparison that only
+    ever yields a fixed literal.
+    """
+    lowered = name.replace("\\", "/").lower()
+    for ext in KNOWN_EXTS:
+        if lowered.endswith(ext):
+            return ext
+    return ""
+
+
+def _sniff_path(ext: str) -> Path:
+    """A throwaway path whose suffix is *ext*, used only for ``Path.suffix``.
+
+    Container sniffing reads the suffix and the bytes; it does not open this
+    path. Reject anything that is not a single extension so a caller-supplied
+    suffix cannot smuggle a separator into the throwaway path.
+    """
+    if not ext.startswith(".") or "/" in ext or "\\" in ext or "\x00" in ext or ext.count(".") != 1:
+        return Path("input")
+    return Path(f"input{ext}")
+
 
 def classify_bytes(data: bytes, suffix: str | None = None) -> Kind:
     """Classify *data* by extension first, then by magic bytes.
@@ -151,7 +185,7 @@ def classify_bytes(data: bytes, suffix: str | None = None) -> Kind:
     if detect_av_format(data) != "unknown":
         return "av"
     if data:
-        sniff_path = Path("input") if not ext else Path(f"input{ext}")
+        sniff_path = _sniff_path(ext)
         if detect_container_format(sniff_path, data) != "unknown":
             return "container"
     return "unknown"
@@ -183,7 +217,7 @@ def classify(path: Path) -> Kind:
         return "av"
     if head:
         data = path.read_bytes() if head[:4] == b"PK\x03\x04" else head
-        sniff_path = Path("input") if not ext else Path(f"input{ext}")
+        sniff_path = _sniff_path(ext)
         if detect_container_format(sniff_path, data) != "unknown":
             return "container"
     return "unknown"

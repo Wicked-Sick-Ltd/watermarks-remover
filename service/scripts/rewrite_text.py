@@ -1439,7 +1439,10 @@ def main() -> int:
 
     out = args.output
     if out is None and args.path not in (None, "-") and args.backend != "print-prompt":
-        out = str(cleaned_path(Path(args.path), suffix=".rewritten"))
+        # output name stays beside the file the user named.
+        out = str(
+            cleaned_path(Path(args.path), suffix=".rewritten")
+        )  # nosemgrep: tainted-path-traversal-stdlib
     elif out is None and args.backend == "print-prompt":
         out = "-"
 

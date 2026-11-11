@@ -28,6 +28,7 @@ from xml.etree import ElementTree as ET
 from common import (
     c2patool_probe_note,
     classify_finding_confidence,
+    confined_path,
     safe_arg,
     safe_write_bytes,
     safe_write_text,
@@ -2105,7 +2106,8 @@ def office_owner_file(path: Path) -> Path | None:
         names.append(f"~${path.name[2:]}")
     for name in dict.fromkeys(names):
         candidate = path.with_name(name)
-        if candidate.exists():
+        # sibling name in the same directory as the file the caller named.
+        if candidate.exists():  # nosemgrep: tainted-path-traversal-stdlib
             return candidate
     return None
 
@@ -3953,11 +3955,24 @@ def _pdf_show_attachment(path: Path, key: str, tmp: Path, deadline: "_Deadline |
     return total
 
 
+def _attachment_suffix(name: str) -> str:
+    """Extension safe to append under a temp dir: an allowlisted literal, or ``""``.
+
+    Attachment names come from the file being cleaned. ``Path.suffix`` can still
+    carry a NUL (``evil.\\x00png``), and the OS would then open a different
+    file than the one the path string names. The allowlist returns a fixed
+    literal, so nothing from the name reaches the path.
+    """
+    from format_dispatch import allowlisted_suffix  # local: avoids an import cycle
+
+    return allowlisted_suffix(name)
+
+
 def _classify_attachment(name: str, data: bytes) -> str:
     """Route an attachment to the same pipelines as a standalone file."""
     from format_dispatch import classify_bytes  # local: avoids an import cycle
 
-    return classify_bytes(data, Path(name).suffix)
+    return classify_bytes(data, _attachment_suffix(name))
 
 
 def _pdf_inspect_attachments(
@@ -3982,7 +3997,7 @@ def _pdf_inspect_attachments(
             # Sanitise the temp name: keep the suffix so classification works,
             # drop any directory separators in the attachment's own name.
             safe_name = Path(att["name"]).name or f"att-{i}"
-            tmp = Path(staging) / f"att-{i}{Path(safe_name).suffix}"
+            tmp = confined_path(staging, f"att-{i}{_attachment_suffix(safe_name)}")
             n = _pdf_show_attachment(path, att["key"], tmp, deadline)
             if n < 0:
                 results.append({**att, "kind": "unknown", "error": "extract failed"})
@@ -4054,7 +4069,7 @@ def _pdf_extract_attachments(
     skipped: list[dict] = []
     for i, att in enumerate(attachments):
         safe_name = Path(att["name"]).name or f"att-{i}"
-        in_path = staging / f"{i}-in{Path(safe_name).suffix}"
+        in_path = confined_path(staging, f"{i}-in{_attachment_suffix(safe_name)}")
         n = _pdf_show_attachment(path, att["key"], in_path, deadline)
         if n < 0:
             skipped.append({**att, "error": "extract failed"})
@@ -4117,7 +4132,7 @@ def _pdf_clean_attachments(
             name = att["name"]
             in_path = att["in_path"]
             data = in_path.read_bytes()
-            ext = Path(name).suffix or Path(in_path.name).suffix
+            ext = _attachment_suffix(name) or _attachment_suffix(in_path.name)
             kind = _classify_attachment(name, data)
             has_c2pa, has_ai, findings = _inspect_attachment_bytes(
                 in_path, data, kind, depth, deadline
@@ -4150,7 +4165,7 @@ def _pdf_clean_attachments(
                 )
                 continue
             processed = True
-            clean_path = Path(staging) / f"att-{i}-out{ext}"
+            clean_path = confined_path(staging, f"att-{i}-out{ext}")
             safe_write_bytes(clean_path, cleaned_bytes)
             if not _add_attachment(
                 dest, att, clean_path, staging, remove_existing=dest_has, deadline=deadline

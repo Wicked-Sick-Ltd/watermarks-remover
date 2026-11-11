@@ -25,12 +25,31 @@ EXIT_HOOK_ERROR = 1
 EXIT_SHOW_MODEL = 2
 
 
-def run_hook(payload, *args: str, env: dict[str, str] | None = None):
+def run_hook(
+    payload,
+    *args: str,
+    env: dict[str, str] | None = None,
+    root: Path | str | None = None,
+    cwd: Path | None = None,
+):
     full_env = os.environ.copy()
-    # Both mode sources have to be cleared, or an ambient plugin option would
-    # silently decide what mode these tests exercise.
-    full_env.pop("WATERMARKS_HOOK_MODE", None)
-    full_env.pop("CLAUDE_PLUGIN_OPTION_HOOK_MODE", None)
+    # Mode and root sources have to be cleared, or an ambient plugin option
+    # would silently decide what these tests exercise.
+    for var in (
+        "WATERMARKS_HOOK_MODE",
+        "CLAUDE_PLUGIN_OPTION_HOOK_MODE",
+        "WATERMARKS_HOOK_ROOT",
+        "CLAUDE_PROJECT_DIR",
+    ):
+        full_env.pop(var, None)
+    # The hook only touches files under its allowlisted root. Tests write into
+    # tmp_path while running from the repo, so the root has to be passed; the
+    # payload's cwd is the natural stand-in for the project directory. The hook
+    # itself never reads that cwd.
+    if root is None and isinstance(payload, dict):
+        root = payload.get("cwd")
+    if root is not None:
+        full_env["WATERMARKS_HOOK_ROOT"] = str(root)
     full_env.update(env or {})
     return subprocess.run(
         [sys.executable, str(HOOK), *args],
@@ -39,6 +58,7 @@ def run_hook(payload, *args: str, env: dict[str, str] | None = None):
         encoding="utf-8",
         capture_output=True,
         env=full_env,
+        cwd=cwd,
         check=False,
     )
 
@@ -176,16 +196,31 @@ def test_clean_does_not_leave_temp_files_behind(marked_file):
 # --------------------------------------------------------------------------
 
 
-def test_relative_file_path_resolves_against_the_payload_cwd(marked_file):
+def test_relative_file_path_resolves_against_the_hook_root(marked_file):
+    payload = {
+        "tool_name": "Edit",
+        "tool_input": {"file_path": marked_file.name},
+    }
+
+    result = run_hook(payload, root=marked_file.parent)
+
+    assert result.returncode == EXIT_SHOW_MODEL
+
+
+def test_relative_file_path_is_not_anchored_at_the_payload_cwd(marked_file, tmp_path_factory):
+    # The payload's cwd is chosen by the same caller as file_path, so it must
+    # not pick where a relative path lands.
+    root = tmp_path_factory.mktemp("project")
     payload = {
         "tool_name": "Edit",
         "tool_input": {"file_path": marked_file.name},
         "cwd": str(marked_file.parent),
     }
 
-    result = run_hook(payload)
+    result = run_hook(payload, root=root)
 
-    assert result.returncode == EXIT_SHOW_MODEL
+    assert result.returncode == EXIT_QUIET
+    assert result.stdout == ""
 
 
 def test_notebook_edit_payload_uses_notebook_path(marked_file):
@@ -231,6 +266,104 @@ def test_empty_stdin_is_a_silent_no_op():
 
     assert result.returncode == EXIT_QUIET
     assert result.stdout == ""
+
+
+@pytest.mark.parametrize("mode", ["check", "clean"])
+def test_file_outside_the_root_is_skipped_and_left_untouched(tmp_path, mode):
+    outside = tmp_path / "secret.md"
+    outside.write_bytes(MARKED.read_bytes())
+    root = tmp_path / "project"
+    root.mkdir()
+    before = outside.read_bytes()
+
+    result = run_hook(write_event(outside), "--mode", mode, root=root)
+
+    assert result.returncode == EXIT_QUIET
+    assert result.stdout == ""
+    assert "outside" in result.stderr
+    assert outside.read_bytes() == before
+
+
+def test_traversal_out_of_the_root_is_skipped(tmp_path):
+    outside = tmp_path / "secret.md"
+    outside.write_bytes(MARKED.read_bytes())
+    root = tmp_path / "project"
+    root.mkdir()
+    climb = Path(os.path.relpath(outside, root))
+    assert ".." in climb.parts
+    payload = {"tool_name": "Write", "tool_input": {"file_path": str(climb)}}
+
+    result = run_hook(payload, root=root)
+
+    assert result.returncode == EXIT_QUIET
+    assert result.stdout == ""
+    assert "outside" in result.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation needs a privilege on Windows")
+def test_in_root_symlink_keeps_the_link_suffix_for_dispatch(tmp_path):
+    # draft.txt -> blob (no extension). Resolving would classify the target as
+    # unknown and skip the marks. The hook must keep the name the tool wrote.
+    blob = tmp_path / "blob"
+    blob.write_bytes(MARKED.read_bytes())
+    link = tmp_path / "draft.txt"
+    link.symlink_to(blob)
+
+    result = run_hook(write_event(link), root=tmp_path)
+
+    assert result.returncode == EXIT_SHOW_MODEL
+    assert "U+200B" in result.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation needs a privilege on Windows")
+def test_symlink_outside_the_root_pointing_inside_is_not_replaced(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    inside = root / "file.txt"
+    inside.write_bytes(MARKED.read_bytes())
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = outside / "draft.txt"
+    link.symlink_to(inside)
+    before = inside.read_bytes()
+
+    result = run_hook(write_event(link), "--mode", "clean", root=root)
+
+    assert result.returncode == EXIT_QUIET
+    assert link.is_symlink()
+    assert inside.read_bytes() == before
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation needs a privilege on Windows")
+def test_symlink_inside_the_root_pointing_outside_is_skipped(tmp_path):
+    outside = tmp_path / "secret.md"
+    outside.write_bytes(MARKED.read_bytes())
+    root = tmp_path / "project"
+    root.mkdir()
+    link = root / "innocent.md"
+    link.symlink_to(outside)
+    before = outside.read_bytes()
+
+    result = run_hook(write_event(link), "--mode", "clean", root=root)
+
+    assert result.returncode == EXIT_QUIET
+    assert "outside" in result.stderr
+    assert outside.read_bytes() == before
+    assert link.is_symlink()
+
+
+def test_nul_byte_in_the_path_is_skipped(tmp_path, marked_file):
+    payload = {
+        "tool_name": "Write",
+        "tool_input": {"file_path": f"{marked_file}\x00/../../etc/passwd"},
+    }
+
+    result = run_hook(payload, root=tmp_path)
+
+    assert result.returncode == EXIT_QUIET
+    assert result.stdout == ""
+    assert "Traceback" not in result.stderr
+    assert "NUL" in result.stderr
 
 
 @pytest.mark.parametrize("payload", ["not json at all", '["a", "list"]'])

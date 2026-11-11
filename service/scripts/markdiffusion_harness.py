@@ -148,11 +148,15 @@ def _load_diffusion(model: str, device: str, offline: bool, size: int):
 def _resolve_config(upstream: Path | None, config: str | None) -> str | None:
     if not config:
         return None
+    # CLI opens the config file the user named; no extra concatenation.
+    # nosemgrep: tainted-path-traversal-stdlib
     path = Path(config).expanduser().resolve()
-    if not path.is_file():
+    # CLI opens the config file the user named; no extra concatenation.
+    if not path.is_file():  # nosemgrep: tainted-path-traversal-stdlib
         raise _Unavailable(f"MarkDiffusion config not found: {path}")
     try:
-        size = path.stat().st_size
+        # CLI opens the config file the user named; no extra concatenation.
+        size = path.stat().st_size  # nosemgrep: tainted-path-traversal-stdlib
     except OSError as e:
         raise _Unavailable(f"cannot stat MarkDiffusion config {path}: {e}") from e
     if size > MAX_CONFIG_BYTES:
@@ -300,7 +304,10 @@ def _cmd_watermark(args: argparse.Namespace, upstream: Path | None, scheme: str)
 
 
 def _cmd_detect(args: argparse.Namespace, upstream: Path | None, scheme: str) -> int:
-    if args.path != "-" and not Path(args.path).is_file():
+    # CLI opens the file the user named; no extra concatenation.
+    if (
+        args.path != "-" and not Path(args.path).is_file()
+    ):  # nosemgrep: tainted-path-traversal-stdlib
         eprint(f"not a file: {args.path}")
         return 2
 
@@ -329,7 +336,8 @@ def _cmd_detect(args: argparse.Namespace, upstream: Path | None, scheme: str) ->
             algorithm_config=config_path,
             diffusion_config=diffusion_config,
         )
-        image = Image.open(args.path).convert("RGB")
+        # CLI opens the file the user named; no extra concatenation.
+        image = Image.open(args.path).convert("RGB")  # nosemgrep: tainted-path-traversal-stdlib
         kwargs: dict[str, Any] = {}
         if args.detector_type:
             kwargs["detector_type"] = args.detector_type
@@ -363,7 +371,8 @@ def _cmd_detect(args: argparse.Namespace, upstream: Path | None, scheme: str) ->
 
 
 def _cmd_purify(args: argparse.Namespace, upstream: Path | None) -> int:
-    if not Path(args.path).is_file():
+    # CLI opens the file the user named; no extra concatenation.
+    if not Path(args.path).is_file():  # nosemgrep: tainted-path-traversal-stdlib
         eprint(f"not a file: {args.path}")
         return 2
 
@@ -390,7 +399,8 @@ def _cmd_purify(args: argparse.Namespace, upstream: Path | None) -> int:
             purification_strength=args.purification_intensity,
             prompt=args.prompt or "",
         )
-        image = Image.open(args.path).convert("RGB")
+        # CLI opens the file the user named; no extra concatenation.
+        image = Image.open(args.path).convert("RGB")  # nosemgrep: tainted-path-traversal-stdlib
         purified = purifier.edit(image)
     except _Unavailable as e:
         eprint(str(e))

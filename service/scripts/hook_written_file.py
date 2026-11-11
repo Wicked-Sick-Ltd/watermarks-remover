@@ -16,6 +16,13 @@ Modes:
   check  report provenance marks, leave the file alone (default)
   clean  strip them in place, then report what changed
 
+The payload is untrusted input: whatever produced the tool call also chose
+``file_path``. The hook therefore only ever touches files confined under one
+allowlisted root -- ``WATERMARKS_HOOK_ROOT``, else ``CLAUDE_PROJECT_DIR`` (set
+by Claude Code for every hook), else the hook's own working directory. A path
+that resolves outside that root, including through a symlink, is skipped.
+The payload's own ``cwd`` is never used as the anchor.
+
 Exit codes follow the PostToolUse contract: 0 = nothing to say, 2 = stderr is
 shown to the model. It never blocks a tool call, because PostToolUse fires
 after the tool has already run.
@@ -36,9 +43,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from audit_lib import is_actionable, scan_file
-from common import MAX_INPUT_BYTES, eprint, subprocess_creationflags
+from common import MAX_INPUT_BYTES, eprint, require_confined, subprocess_creationflags
 
 CLEAN_FILE_PY = Path(__file__).resolve().parent / "clean_file.py"
+
+# Where the allowlisted root comes from, most explicit first. Claude Code
+# exports CLAUDE_PROJECT_DIR to every hook it runs; the override exists for
+# other harnesses and for tests.
+ROOT_ENV_VARS = ("WATERMARKS_HOOK_ROOT", "CLAUDE_PROJECT_DIR")
 
 # Tools whose payload names a single file the agent just wrote. The hook
 # matcher should filter these too; this is the defensive second check.
@@ -80,8 +92,37 @@ def resolve_mode(requested: str | None) -> str:
     return DEFAULT_MODE
 
 
-def target_path(payload: dict) -> Path | None:
-    """The file the tool call wrote, or None when the payload names no file."""
+class OutsideRoot(ValueError):
+    """The payload names a file the hook is not allowed to touch."""
+
+
+def hook_root() -> Path:
+    """The one directory this hook may read or rewrite under.
+
+    Taken from the environment, never from the payload: the payload's ``cwd``
+    is set by the same untrusted caller as ``file_path``, so anchoring the
+    check on it would let the payload choose its own confinement root.
+    """
+    for var in ROOT_ENV_VARS:
+        value = os.environ.get(var, "").strip()
+        if value:
+            return Path(value).expanduser().resolve()
+    return Path.cwd().resolve()
+
+
+def target_path(payload: dict, root: Path) -> Path | None:
+    """The file the tool call wrote, confined under *root*.
+
+    Returns None when the payload names no file at all. Raises
+    :class:`OutsideRoot` when it names one the hook must not touch: a NUL
+    byte, a traversal segment, an absolute path elsewhere, or a symlink that
+    resolves outside the root. A relative path is anchored at the root.
+
+    The returned path keeps the name the tool wrote, so dispatch still sees
+    that suffix, but both that directory entry and its symlink target have to
+    sit under *root*. A symlink that lives outside the root and only points
+    in is rejected: cleaning would otherwise replace it from outside.
+    """
     if payload.get("tool_name") not in FILE_WRITING_TOOLS:
         return None
 
@@ -91,12 +132,36 @@ def target_path(payload: dict) -> Path | None:
     raw = tool_input.get("file_path") or tool_input.get("notebook_path")
     if not isinstance(raw, str) or not raw.strip():
         return None
+    if "\x00" in raw:
+        raise OutsideRoot("file path contains a NUL byte")
 
+    # file the hook was asked to read; confined under the allowlisted root before any open.
+    # nosemgrep: tainted-path-traversal-stdlib
     path = Path(raw).expanduser()
     if not path.is_absolute():
-        # Hook payloads may carry a project-relative path; cwd is the session's.
-        path = Path(payload.get("cwd") or Path.cwd()) / path
-    return path
+        # Joined only to the trusted root, then require_confined rejects escapes.
+        path = root / path  # nosemgrep: tainted-path-traversal-stdlib
+    try:
+        # The directory entry itself must live under the root. Resolving the
+        # whole path would follow a symlink that sits outside and only points
+        # in, and clean mode would then replace that outside symlink.
+        parent = path.parent.resolve()
+        base = root.resolve()
+        if parent != base and base not in parent.parents:
+            raise OutsideRoot("file path is outside the hook root")
+        if path.name in ("", ".", ".."):
+            raise OutsideRoot("file path is outside the hook root")
+        located = parent / path.name
+        # The opened target, including a final symlink, must also stay inside.
+        require_confined(located, base)
+    except OutsideRoot:
+        raise
+    except ValueError as error:
+        raise OutsideRoot(str(error)) from None
+    except (OSError, RuntimeError) as error:
+        # resolve() failed: a symlink loop, or a component we cannot stat.
+        raise OutsideRoot(f"cannot resolve {raw!r}: {error}") from None
+    return located
 
 
 def _emit(system_message: str, additional_context: str | None = None) -> None:
@@ -113,7 +178,8 @@ def _emit(system_message: str, additional_context: str | None = None) -> None:
 def run_check(path: Path) -> int:
     # scan_file/is_actionable are audit_dir.py's own per-file logic, so this
     # hook, the pre-commit gate, and the CI SARIF export agree on what counts.
-    item = scan_file(path)
+    # file the hook was asked to read; already confined under the allowlisted root.
+    item = scan_file(path)  # nosemgrep: tainted-path-traversal-stdlib
     if item.get("kind") == "unknown" or not is_actionable(item):
         return EXIT_QUIET
 
@@ -175,7 +241,8 @@ def run_clean(path: Path) -> int:
             return EXIT_HOOK_ERROR
 
         residual = result.get("still_has_c2pa") or result.get("still_has_ai_metadata")
-        if temp_path.read_bytes() == path.read_bytes():
+        # file the hook was asked to read; already confined under the allowlisted root.
+        if temp_path.read_bytes() == path.read_bytes():  # nosemgrep: tainted-path-traversal-stdlib
             if residual:
                 findings = result.get("post_findings") or []
                 detail = "; ".join(str(finding) for finding in findings) or _describe(result)
@@ -252,10 +319,19 @@ def main(argv: list[str] | None = None) -> int:
         eprint("watermarks-remover: hook payload was not a JSON object")
         return EXIT_HOOK_ERROR
 
-    path = target_path(payload)
-    if path is None or not path.is_file():
+    root = hook_root()
+    try:
+        path = target_path(payload, root)
+    except OutsideRoot as error:
+        # Not the hook's file to touch. Quiet on the harness side (exit 0),
+        # with the reason on stderr for anyone debugging a skipped file.
+        eprint(f"watermarks-remover: skipping file outside {root}: {error}")
         return EXIT_QUIET
-    if path.stat().st_size > MAX_INPUT_BYTES:
+    # file the hook was asked to read; already confined under the allowlisted root.
+    if path is None or not path.is_file():  # nosemgrep: tainted-path-traversal-stdlib
+        return EXIT_QUIET
+    # file the hook was asked to read; already confined under the allowlisted root.
+    if path.stat().st_size > MAX_INPUT_BYTES:  # nosemgrep: tainted-path-traversal-stdlib
         return EXIT_QUIET
 
     mode = resolve_mode(args.mode)

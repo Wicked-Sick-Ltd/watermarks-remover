@@ -83,15 +83,20 @@ def main() -> int:
     )
     args = p.parse_args()
 
-    if not args.path.is_file():
+    # CLI opens the file the user named; no extra concatenation.
+    if not args.path.is_file():  # nosemgrep: tainted-path-traversal-stdlib
         eprint(f"not a file: {args.path}")
         return 2
 
-    if args.path.stat().st_size > MAX_INPUT_BYTES:
+    # CLI opens the file the user named; no extra concatenation.
+    if args.path.stat().st_size > MAX_INPUT_BYTES:  # nosemgrep: tainted-path-traversal-stdlib
         eprint(f"refusing input larger than {MAX_INPUT_BYTES} bytes: {args.path}")
         return 2
 
-    kind = args.force_type if args.force_type != "auto" else classify(args.path)
+    # CLI opens the file the user named; no extra concatenation.
+    kind = (
+        args.force_type if args.force_type != "auto" else classify(args.path)
+    )  # nosemgrep: tainted-path-traversal-stdlib
 
     # classify() reports "unknown" for bytes that match no supported format.
     # Never mutate those in auto mode: a binary with valid UTF-8 runs would
@@ -112,7 +117,10 @@ def main() -> int:
     # route identically.
     container_fmt = None
     if kind == "container":
-        container_fmt = detect_container_format(args.path, args.path.read_bytes())
+        # CLI opens the file the user named; no extra concatenation.
+        container_fmt = detect_container_format(
+            args.path, args.path.read_bytes()
+        )  # nosemgrep: tainted-path-traversal-stdlib
         if container_fmt in {"docx", "xlsx", "pptx"}:
             owner_file = office_owner_file(args.path)
             if owner_file is not None:
@@ -126,7 +134,10 @@ def main() -> int:
     # binary would otherwise be decoded, scrubbed and written back mangled.
     # Sniff before --in-place takes a backup: refusing afterwards would leave a
     # .bak sidecar behind for a file this run never touches.
-    raw = args.path.read_bytes() if kind == "text" else None
+    # CLI opens the file the user named; no extra concatenation.
+    raw = (
+        args.path.read_bytes() if kind == "text" else None
+    )  # nosemgrep: tainted-path-traversal-stdlib
     if raw is not None:
         guard_binary(
             raw,

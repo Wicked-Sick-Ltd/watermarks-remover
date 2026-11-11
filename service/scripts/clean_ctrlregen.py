@@ -105,7 +105,8 @@ def main() -> int:
     p.add_argument("--json", action="store_true", help="Emit JSON on stdout")
     args = p.parse_args()
 
-    if not args.path.is_file():
+    # CLI opens the file the user named; no extra concatenation.
+    if not args.path.is_file():  # nosemgrep: tainted-path-traversal-stdlib
         print(f"not a file: {args.path}", file=sys.stderr)
         return 2
     if not 0 < args.intensity <= 1:
@@ -146,7 +147,8 @@ def main() -> int:
         return 3
 
     try:
-        image = Image.open(args.path).convert("RGB")
+        # CLI opens the file the user named; no extra concatenation.
+        image = Image.open(args.path).convert("RGB")  # nosemgrep: tainted-path-traversal-stdlib
         image.load()
     except Exception as e:
         print(f"could not load image: {e}", file=sys.stderr)

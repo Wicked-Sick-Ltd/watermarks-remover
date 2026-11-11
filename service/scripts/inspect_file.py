@@ -42,11 +42,13 @@ def main() -> int:
     )
     args = p.parse_args()
 
-    if not args.path.is_file():
+    # CLI opens the file the user named; no extra concatenation.
+    if not args.path.is_file():  # nosemgrep: tainted-path-traversal-stdlib
         eprint(f"not a file: {args.path}")
         return 2
 
-    if args.path.stat().st_size > MAX_INPUT_BYTES:
+    # CLI opens the file the user named; no extra concatenation.
+    if args.path.stat().st_size > MAX_INPUT_BYTES:  # nosemgrep: tainted-path-traversal-stdlib
         eprint(f"refusing input larger than {MAX_INPUT_BYTES} bytes: {args.path}")
         return 2
 

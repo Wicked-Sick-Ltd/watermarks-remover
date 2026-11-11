@@ -25,7 +25,8 @@ def main() -> int:
     )
     args = p.parse_args()
 
-    if not args.path.is_file():
+    # CLI opens the file the user named; no extra concatenation.
+    if not args.path.is_file():  # nosemgrep: tainted-path-traversal-stdlib
         print(f"not a file: {args.path}", file=sys.stderr)
         return 2
 

@@ -20,6 +20,9 @@ Known scope limits (documented, not silently mishandled):
 - MP3: ID3v2.2 (3-byte frame IDs, pre-iTunes era) tags are detected but not
   decomposed into frames -- stripping falls back to a whole-tag drop, which
   is always safe. ID3v1 (fixed 128-byte trailer at EOF) is not handled.
+- MP3/FLAC/WAV: at most MAX_ID3V2_FRAMES ID3v2 frames are decoded per file.
+  Past that the tag is reported as truncated and only byte-scanned, and
+  cleaning drops the whole tag.
 """
 
 from __future__ import annotations

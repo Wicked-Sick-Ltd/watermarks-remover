@@ -1053,7 +1053,7 @@ Layer B makes sense when you specifically want the premium model's **thinking an
 | Markdown | YAML frontmatter AI keys, `<!-- -->` comments naming an AI tool or marked AI-generated / C2PA / content credential (outside code fences) | Drop keys and comments + Layer A body |
 | MP4 / MOV / M4A / M4V | ISOBMFF `jumb`/`uuid` boxes (same mechanism as AVIF/HEIC) + `moov/udta` generator tags | Drop boxes |
 | WAV | RIFF `C2PA` / `LIST INFO` chunks, embedded `id3\x20` chunk | Drop chunks |
-| MP3 | ID3v2 frames (v2.3/v2.4 per-frame; v2.2 whole-tag) | Drop matched frames or whole tag |
+| MP3 | ID3v2 frames (v2.3/v2.4 per-frame up to 8192 frames; v2.2 or larger tags whole-tag) | Drop matched frames or whole tag |
 | FLAC | C2PA manifest in an ID3v2 `GEOB` frame | Drop the matched frame or whole ID3v2 tag |
 
 FLAC support covers C2PA's standardized ID3v2 carrier. Native FLAC metadata blocks,

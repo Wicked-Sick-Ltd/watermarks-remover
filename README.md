@@ -508,6 +508,7 @@ set -a; . ./.env; set +a; python3 service/scripts/rewrite_text.py /tmp/x.txt -o 
 | `WATERMARKS_SYNTHID_TEXT_URL` | `wr-core` | Point core at the `wr-synthid-text` sidecar for SynthID text watermarking (e.g. `http://wr-synthid-text:8767` under the harness profile) |
 | `WATERMARKS_SYNTHID_TEXT_API_KEY` | `wr-core` + `wr-synthid-text` | Shared bearer key for the text watermark sidecar (empty = no auth) |
 | `WATERMARKS_SYNTHID_TEXT_TIMEOUT` | `wr-core` | Seconds to wait for the `wr-synthid-text` sidecar (default 120) |
+| `WATERMARKS_ALLOWED_TEXT_MODELS` | `wr-core` + `wr-synthid-text` | Comma-separated extra Hugging Face model ids a `/watermark` request may select via `options.model`; the default model (`facebook/opt-1.3b`, or the sidecar's `WATERMARKS_SYNTHID_TEXT_MODEL`) is always allowed and every other id is refused |
 | `WATERMARKS_MARKLLM_SCHEME` | `text_detectors.py` (host) | MarkLLM scheme for `/detect`: `kgw` (default) / `synthid` |
 | `HF_TOKEN` | harness/heavy services | Hugging Face token for gated models |
 | `WATERMARKS_SERVICE_URL` | client only (skill / curl) | Where to reach the service; default `http://127.0.0.1:8765` |

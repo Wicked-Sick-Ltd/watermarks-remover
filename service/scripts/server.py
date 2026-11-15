@@ -430,7 +430,13 @@ def _watermark_request_schema() -> dict[str, Any]:
                         exclusiveMinimum=True,
                         maximum=1,
                     ),
-                    "model": _schema(type="string"),
+                    "model": _schema(
+                        type="string",
+                        description=(
+                            "Hugging Face model id; must be the backend default "
+                            "(facebook/opt-1.3b) or listed in WATERMARKS_ALLOWED_TEXT_MODELS"
+                        ),
+                    ),
                     "device": _schema(
                         type="string",
                         description="Inference device (e.g. 'cpu', 'cuda', 'cuda:0')",

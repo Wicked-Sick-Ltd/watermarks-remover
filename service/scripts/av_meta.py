@@ -27,7 +27,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from common import classify_finding_confidence, safe_write_bytes
 from image_meta import (
@@ -75,7 +75,7 @@ def detect_av_format(data: bytes) -> str:
         return "flac"
     if len(data) >= 10 and data[:3] == b"ID3":
         parsed = _parse_id3v2_frames(data)
-        if parsed is not None and data[parsed[0] : parsed[0] + 4] == b"fLaC":
+        if parsed is not None and data[parsed.total : parsed.total + 4] == b"fLaC":
             return "flac"
         return "mp3"
     if len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0:
@@ -183,13 +183,55 @@ def _id3v2_frames_start(data: bytes, total: int, major: int) -> int | None:
     return pos if pos <= total else None
 
 
-def _parse_id3v2_frames(data: bytes) -> tuple[int, int, list[tuple[bytes, bytes]]] | None:
+# Real tags (text frames, artwork, chapters, lyrics) stay far below this, while
+# a tag of empty 10-byte frames under the request body cap reaches millions.
+MAX_ID3V2_FRAMES = 8192
+# Window for byte-scanning the part of a tag past the frame cap, so that scan
+# never copies the whole tag.
+_ID3V2_SCAN_WINDOW = 8192
+
+
+class _ID3v2Tag(NamedTuple):
+    total: int
+    major: int
+    frames: list[tuple[bytes, bytes]]
+    # True when the walk stopped at the frame limit; frames past scanned_end
+    # (up to the end of the tag) were never decoded or validated.
+    truncated: bool = False
+    scanned_end: int = 0
+
+
+def _id3v2_truncated_finding(tag: _ID3v2Tag) -> str:
+    return (
+        f"truncated ID3v2.{tag.major} frame scan: stopped at the {MAX_ID3V2_FRAMES}-frame "
+        "limit, tag not fully inspected — metadata may be incomplete"
+    )
+
+
+def _contains_any_windowed(
+    data: bytes, start: int, end: int, needles: tuple[bytes, ...]
+) -> list[str]:
+    """`_contains_any` over data[start:end], copying at most one window at a time."""
+    overlap = max(len(n) for n in needles) - 1
+    found: set[bytes] = set()
+    pos = start
+    while pos < end and len(found) < len(needles):
+        window_end = min(end, pos + _ID3V2_SCAN_WINDOW)
+        lower = data[max(start, pos - overlap) : window_end].lower()
+        found.update(n for n in needles if n.lower() in lower)
+        pos = window_end
+    return [n.decode("ascii", errors="replace") for n in needles if n in found]
+
+
+def _parse_id3v2_frames(data: bytes, max_frames: int = MAX_ID3V2_FRAMES) -> _ID3v2Tag | None:
     """Parse an ID3v2 tag at the start of *data*.
 
-    Returns (tag_total_size, major_version, frames); frames is a list of
-    (frame_id, frame_payload) for v2.3/v2.4 tags (4-byte frame IDs). v2.2
-    tags (3-byte frame IDs) are detected but returned with an empty frame
-    list -- callers fall back to whole-tag byte-scanning and whole-tag drop.
+    Returns (tag_total_size, major_version, frames, truncated, scanned_end);
+    frames is a list of (frame_id, frame_payload) for v2.3/v2.4 tags (4-byte
+    frame IDs). v2.2 tags (3-byte frame IDs) are detected but returned with an
+    empty frame list -- callers fall back to whole-tag byte-scanning and
+    whole-tag drop. At most *max_frames* frames are decoded; a tag with more
+    comes back with ``truncated`` set and only those frames.
     """
     if len(data) < 10 or data[:3] != b"ID3":
         return None
@@ -203,7 +245,7 @@ def _parse_id3v2_frames(data: bytes) -> tuple[int, int, list[tuple[bytes, bytes]
     if footer_size and data[frames_end:total] != b"3DI" + data[3:10]:
         return None
     if major < 3:
-        return total, major, []
+        return _ID3v2Tag(total, major, [], scanned_end=total)
 
     frames: list[tuple[bytes, bytes]] = []
     pos = _id3v2_frames_start(data, frames_end, major)
@@ -213,6 +255,8 @@ def _parse_id3v2_frames(data: bytes) -> tuple[int, int, list[tuple[bytes, bytes]
         frame_id = data[pos : pos + 4]
         if frame_id == b"\x00\x00\x00\x00":
             break  # padding
+        if len(frames) >= max_frames:
+            return _ID3v2Tag(total, major, frames, truncated=True, scanned_end=pos)
         frame_size = (
             _id3v2_size(data, pos + 4)
             if major == 4
@@ -226,10 +270,16 @@ def _parse_id3v2_frames(data: bytes) -> tuple[int, int, list[tuple[bytes, bytes]
         pos = frame_end
     if any(data[pos:frames_end]):
         return None
-    return total, major, frames
+    return _ID3v2Tag(total, major, frames, scanned_end=total)
 
 
 def _inspect_id3v2(data: bytes) -> tuple[bool, bool, list[str]]:
+    has_c2pa, has_ai, findings, _decoded = _inspect_id3v2_tag(data, MAX_ID3V2_FRAMES)
+    return has_c2pa, has_ai, findings
+
+
+def _inspect_id3v2_tag(data: bytes, max_frames: int) -> tuple[bool, bool, list[str], int]:
+    """`_inspect_id3v2` decoding at most *max_frames* frames; also returns how many it decoded."""
     if len(data) >= 10 and data[:3] == b"ID3":
         major = data[3]
         tag_size = _id3v2_size(data, 6)
@@ -243,23 +293,23 @@ def _inspect_id3v2(data: bytes) -> tuple[bool, bool, list[str]]:
             ]
             if hits:
                 findings.append(f"partial ID3v2.{major} tag markers: {', '.join(hits[:8])}")
-            return has_c2pa, bool(hits), findings
+            return has_c2pa, bool(hits), findings, 0
 
-    parsed = _parse_id3v2_frames(data)
+    parsed = _parse_id3v2_frames(data, max_frames)
     if parsed is None:
-        return False, False, []
-    total, major, frames = parsed
+        return False, False, [], 0
+    total, major, frames = parsed.total, parsed.major, parsed.frames
     findings: list[str] = []
     has_ai = False
     has_c2pa = False
 
-    if not frames:
+    if not frames and not parsed.truncated:
         hits = _contains_any(data[:total], AI_META_HINTS)
         if hits:
             has_ai = True
             has_c2pa = _classify_c2pa(hits)
             findings.append(f"ID3v2.{major} tag: {', '.join(hits[:8])}")
-        return has_c2pa, has_ai, findings
+        return has_c2pa, has_ai, findings, 0
 
     for frame_id, payload in frames:
         hits = _contains_any(payload, AI_META_HINTS)
@@ -269,7 +319,15 @@ def _inspect_id3v2(data: bytes) -> tuple[bool, bool, list[str]]:
                 has_c2pa = True
             label = frame_id.decode("latin-1", errors="replace")
             findings.append(f"ID3v2 frame {label}: {', '.join(hits[:8])}")
-    return has_c2pa, has_ai, findings
+
+    if parsed.truncated:
+        findings.append(_id3v2_truncated_finding(parsed))
+        hits = _contains_any_windowed(data, parsed.scanned_end, total, AI_META_HINTS)
+        if hits:
+            has_ai = True
+            has_c2pa = has_c2pa or _classify_c2pa(hits)
+            findings.append(f"partial ID3v2.{major} tag markers: {', '.join(hits[:8])}")
+    return has_c2pa, has_ai, findings, len(frames)
 
 
 def _is_valid_mp3_frame_header(data: bytes, offset: int) -> bool:
@@ -316,8 +374,16 @@ def _strip_id3v2(data: bytes, *, strip_all_metadata: bool) -> tuple[bytes, list[
     parsed = _parse_id3v2_frames(data)
     if parsed is None:
         return data, []
-    total, major, frames = parsed
+    total, major, frames = parsed.total, parsed.major, parsed.frames
     rest = data[total:]
+
+    if parsed.truncated:
+        # Frames past the cap were never decoded, so none can be kept
+        # selectively; only a whole-tag drop is safe.
+        return rest, [
+            f"drop ID3v2.{major} tag ({total} bytes; frame scan truncated at "
+            f"{MAX_ID3V2_FRAMES} frames)"
+        ]
 
     if not frames:
         # v2.2 (undecomposed) or an empty v2.3/2.4 tag: only a whole-tag drop
@@ -380,18 +446,32 @@ def _inspect_flac(data: bytes) -> tuple[bool, bool, list[str]]:
     parsed = _parse_id3v2_frames(data)
     if parsed is None:
         return False, False, []
-    _total, _major, frames = parsed
-    if any(_is_c2pa_geob(frame_id, payload) for frame_id, payload in frames):
-        return True, True, ["C2PA-related manifest in ID3v2 frame GEOB: application/c2pa"]
-    return False, False, []
+    findings: list[str] = []
+    has_c2pa = False
+    if any(_is_c2pa_geob(frame_id, payload) for frame_id, payload in parsed.frames):
+        has_c2pa = True
+        findings.append("C2PA-related manifest in ID3v2 frame GEOB: application/c2pa")
+    if parsed.truncated:
+        findings.append(_id3v2_truncated_finding(parsed))
+        if _contains_any_windowed(data, parsed.scanned_end, parsed.total, (b"application/c2pa",)):
+            has_c2pa = True
+            findings.append(
+                f"partial ID3v2.{parsed.major} tag markers: application/c2pa past the frame cap"
+            )
+    return has_c2pa, has_c2pa, findings
 
 
 def _strip_flac(data: bytes, *, strip_all_metadata: bool) -> tuple[bytes, list[str]]:
     parsed = _parse_id3v2_frames(data)
     if parsed is None:
         return data, ["no FLAC ID3v2 metadata removed (already clean or none matched)"]
-    total, major, frames = parsed
+    total, major, frames = parsed.total, parsed.major, parsed.frames
     rest = data[total:]
+    if parsed.truncated:
+        return rest, [
+            f"drop FLAC ID3v2.{major} tag ({total} bytes; frame scan truncated at "
+            f"{MAX_ID3V2_FRAMES} frames)"
+        ]
     if strip_all_metadata:
         return rest, [f"drop FLAC ID3v2.{major} tag ({total} bytes)"]
 
@@ -427,6 +507,12 @@ def _inspect_wav(data: bytes) -> tuple[bool, bool, list[str]]:
     findings: list[str] = []
     has_ai = False
     has_c2pa = False
+    # One frame budget for the whole file, so repeating id3 chunks cannot
+    # multiply the per-tag cap. Every chunk costs at least one unit; chunks
+    # past the budget are only byte-scanned and reported once, together.
+    id3_frame_budget = MAX_ID3V2_FRAMES
+    id3_unparsed_chunks = False
+    id3_unparsed_hits: set[str] = set()
     pos = 12  # past "RIFF" + size(4) + "WAVE"
     while pos + 8 <= len(data):
         cid = data[pos : pos + 4]
@@ -447,12 +533,28 @@ def _inspect_wav(data: bytes) -> tuple[bool, bool, list[str]]:
                     has_c2pa = True
                 findings.append(f"WAV LIST INFO chunk: {', '.join(hits[:8])}")
         elif cid in (b"id3 ", b"ID3 "):
-            c2pa, ai, sub_findings = _inspect_id3v2(payload)
-            if ai:
-                has_ai = True
+            if id3_frame_budget > 0:
+                c2pa, ai, sub_findings, decoded = _inspect_id3v2_tag(payload, id3_frame_budget)
+                id3_frame_budget -= max(1, decoded)
+                has_ai = has_ai or ai
                 has_c2pa = has_c2pa or c2pa
                 findings.extend(f"WAV id3 chunk / {f}" for f in sub_findings)
+            else:
+                id3_unparsed_chunks = True
+                id3_unparsed_hits.update(
+                    _contains_any_windowed(payload, 0, len(payload), AI_META_HINTS)
+                )
         pos = cend + (csize & 1)  # chunks are word-aligned
+    if id3_unparsed_chunks:
+        findings.append(
+            f"WAV id3 chunk / truncated ID3v2 frame scan: chunks past the {MAX_ID3V2_FRAMES}-frame "
+            "limit not parsed — metadata may be incomplete"
+        )
+        hits = [h for n in AI_META_HINTS if (h := n.decode("ascii")) in id3_unparsed_hits]
+        if hits:
+            has_ai = True
+            has_c2pa = has_c2pa or _classify_c2pa(hits)
+            findings.append(f"WAV id3 chunk / partial ID3v2 tag markers: {', '.join(hits[:8])}")
     return has_c2pa, has_ai, findings
 
 

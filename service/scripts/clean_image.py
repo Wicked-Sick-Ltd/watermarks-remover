@@ -4,13 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from common import backup_path, cleaned_path, eprint
+from common import backup_path, cleaned_path, eprint, private_copy, read_in_place_source
 from image_meta import clean_image
 
 
@@ -122,19 +123,24 @@ def main() -> int:
         help="Purification subprocess timeout in seconds (default: 3600)",
     )
     args = p.parse_args()
+    with contextlib.ExitStack() as scratch:
+        return _clean(args, scratch)
 
+
+def _clean(args: argparse.Namespace, scratch: contextlib.ExitStack) -> int:
     # CLI opens the file the user named; no extra concatenation.
     if not args.path.is_file():  # nosemgrep: tainted-path-traversal-stdlib
         eprint(f"not a file: {args.path}")
         return 2
 
+    reported_input = None
     if args.in_place:
-        bak, created = backup_path(args.path)
+        source = read_in_place_source(args.path)
+        bak, created = backup_path(args.path, source)
         if not created:
             eprint(f"backup {bak} already exists from an earlier run; keeping the original backup")
-            src = args.path
-        else:
-            src = bak
+        reported_input = bak if created else args.path
+        src = scratch.enter_context(private_copy(source, reported_input.name))
         dest = args.path
     else:
         src = args.path
@@ -164,6 +170,8 @@ def main() -> int:
     except Exception as e:
         eprint(f"error: {e}")
         return 1
+    if reported_input is not None:
+        result["input"] = str(reported_input)
 
     pr = result.get("pixel_removal")
     residual = result["still_has_c2pa"] or result["still_has_ai_metadata"]

@@ -551,9 +551,16 @@ XMP_UUID = b"\xbe\x7a\xcf\xcb\x97\xa9\x42\xe8\x9c\x71\x99\x94\x91\xe3\xaf\xac"
 # box. c2pa-rs writes it this way for video and for AVIF/HEIC images.
 C2PA_BMFF_UUID = b"\xd8\xfe\xc3\xd6\x1b\x0e\x48\x3c\x92\x97\x58\x28\x87\x7e\xc4\x81"
 
+# Real AVIF/HEIC/MP4 files hold a handful of boxes per level. An 8-byte `free`
+# box is legal, so without a count cap the input size limit alone would admit
+# tens of millions of retained box records from one upload. The top-level walk
+# gets this many boxes, and every nested (meta/moov) walk of one file shares
+# a second allowance of the same size.
+MAX_ISOBMFF_BOXES = 4096
+
 
 def _parse_isobmff_boxes(
-    data: bytes, start: int = 0, end: int | None = None
+    data: bytes, start: int = 0, end: int | None = None, limit: int = MAX_ISOBMFF_BOXES
 ) -> tuple[list[tuple[bytes, bytes, int, int]], int]:
     """Parse top-level or container ISOBMFF boxes.
 
@@ -562,6 +569,9 @@ def _parse_isobmff_boxes(
     stopped -- the start of the first box that could not be parsed (an
     overrunning box, or a run of fewer than 8 trailing bytes), or `end`
     when the whole buffer parsed.
+
+    Raises ValueError, before retaining another record, when the walk would
+    return more than *limit* boxes.
     """
     if end is None:
         end = len(data)
@@ -581,6 +591,8 @@ def _parse_isobmff_boxes(
 
         if size < header_size or pos + size > end:
             break
+        if len(boxes) >= limit:
+            raise ValueError(f"too many ISOBMFF boxes (limit {MAX_ISOBMFF_BOXES})")
         payload = data[pos + header_size : pos + size]
         boxes.append((fourcc, payload, size, header_size))
         pos += size
@@ -649,6 +661,7 @@ def inspect_isobmff(data: bytes, fmt: str = "avif") -> tuple[bool, bool, list[st
         findings.append(f"not a valid {fmt.upper()} (no ISOBMFF boxes found)")
         return has_c2pa, has_ai or has_c2pa, findings
 
+    nested_budget = MAX_ISOBMFF_BOXES
     for fourcc, payload, _, _ in boxes:
         name = fourcc.decode("latin-1", errors="replace")
         if fourcc in (b"jumb", b"c2pa") or name.lower().startswith("c2"):
@@ -681,7 +694,8 @@ def inspect_isobmff(data: bytes, fmt: str = "avif") -> tuple[bool, bool, list[st
                     if any(h.lower() in ("c2pa", "contentcredentials", "jumb") for h in hits):
                         has_c2pa = True
         elif fourcc == b"meta":
-            meta_sub, _ = _parse_isobmff_boxes(payload, start=4)
+            meta_sub, _ = _parse_isobmff_boxes(payload, start=4, limit=nested_budget)
+            nested_budget -= len(meta_sub)
             for s_fourcc, s_payload, _, _ in meta_sub:
                 s_name = s_fourcc.decode("latin-1", errors="replace")
                 if s_fourcc in (b"jumb", b"c2pa") or s_name.lower().startswith("c2"):
@@ -2140,6 +2154,7 @@ def strip_isobmff(
     # (#170); the tail is appended verbatim afterwards instead.
     actions: list[str] = []
     out = bytearray()
+    nested_budget = MAX_ISOBMFF_BOXES
 
     for fourcc, payload, size, header_size in boxes:
         name = fourcc.decode("latin-1", errors="replace")
@@ -2164,7 +2179,8 @@ def strip_isobmff(
 
         if fourcc == b"meta":
             meta_verflags = payload[:4] if len(payload) >= 4 else b"\x00\x00\x00\x00"
-            sub_boxes, _ = _parse_isobmff_boxes(payload, start=4)
+            sub_boxes, _ = _parse_isobmff_boxes(payload, start=4, limit=nested_budget)
+            nested_budget -= len(sub_boxes)
             clean_sub = bytearray()
             for s_fourcc, s_payload, s_size, s_hdr in sub_boxes:
                 s_name = s_fourcc.decode("latin-1", errors="replace")

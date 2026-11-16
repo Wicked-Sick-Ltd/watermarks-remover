@@ -810,9 +810,11 @@ Hardening knobs:
   the Hugging Face cache only — zero network egress; fails fast if not cached.
   Custom remote code is never executed (transformers `trust_remote_code` is
   never enabled).
-- `WATERMARKS_MARKLLM_RLIMIT_AS=<bytes>` (env, POSIX) applies an address-space
-  limit to the MarkLLM detector subprocess. Off by default because torch/CUDA
-  usually needs large address spaces.
+- `WATERMARKS_MARKLLM_RLIMIT_AS=<bytes>` (env, POSIX) sets the address-space
+  limit of the MarkLLM detector subprocess (default 32 GiB; raise it if
+  torch/CUDA needs a larger address space). At most one detector subprocess
+  runs per process; concurrent detections wait for it until their
+  `WATERMARKS_MARKLLM_TIMEOUT` deadline.
 - Config files are capped at 1 MiB; the upstream checkout and the base image
   are pinned by SHA/digest.
 
@@ -1368,7 +1370,7 @@ v0.7.0 brings the Layer B statistical-mark rewrite into the `/clean` service its
 - New optional harness (external `THU-BPM/MarkLLM` checkout, Apache-2.0): `detect_text_watermark.py` with `detect` / `watermark` subcommands for KGW and SynthID schemes
 - `rewrite_text.py --markllm-scheme` runs before/after detection around a Layer B rewrite and per-candidate detection when `--candidates N>1` (env-gated; reports `cleared`)
 - `setup_markllm.sh` bootstrap + `requirements-markllm.txt` (pinned deps) + `Dockerfile.markllm` and Makefile `bootstrap-markllm` / `smoke-markllm` / `docker-markllm-build` / `docker-markllm-help`
-- Hardening: `--offline` cache-only model loading (no HF egress, no remote code), 1 MiB config cap, optional `WATERMARKS_MARKLLM_RLIMIT_AS` on the rewrite subprocess, pinned torch in the Dockerfile, and clone-SHA verification in `Dockerfile.markllm`
+- Hardening: `--offline` cache-only model loading (no HF egress, no remote code), 1 MiB config cap, a default `WATERMARKS_MARKLLM_RLIMIT_AS` address-space cap on the MarkLLM detector subprocess, pinned torch in the Dockerfile, and clone-SHA verification in `Dockerfile.markllm`
 - Mock-based tests (`tests/test_markllm_detect.py`, 21 cases) — no torch in CI; verification-harness caveat (same-config-only, not a vendor-detector oracle) documented in README, SKILL.md, `removal-matrix.md`, `vendor-notes.md`
 
 **Fixes and polish**

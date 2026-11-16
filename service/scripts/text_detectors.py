@@ -40,6 +40,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
@@ -49,6 +51,15 @@ from detect_gumbel import DEFAULT_THRESHOLD, DEFAULT_WINDOW, detect_text
 
 DEFAULT_MARKLLM_SCHEME = "kgw"
 DEFAULT_MARKLLM_TIMEOUT = 600.0
+# Address-space cap for the one-shot MarkLLM child when
+# WATERMARKS_MARKLLM_RLIMIT_AS is unset or invalid. Matches the CtrlRegen
+# torch default in image_meta.py.
+DEFAULT_MARKLLM_RLIMIT_AS = 32 << 30
+
+# Every one-shot child loads torch plus a language model, so at most one may
+# run per process regardless of how many detector instances or request
+# threads call detect(). Waiters give up when their detection deadline passes.
+_MARKLLM_CHILD_SLOT = threading.BoundedSemaphore(1)
 
 
 class TextDetector(Protocol):
@@ -111,20 +122,29 @@ def _venv_python(upstream: Path) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
-def _markllm_preexec() -> Callable[[], None] | None:
-    """Optional RLIMIT_AS guard for the MarkLLM child; None means "no limit".
+def _markllm_rlimit_as() -> int:
+    """RLIMIT_AS byte count for the MarkLLM child (always finite and positive).
 
-    torch/CUDA usually needs large address spaces, so this is opt-in via
-    WATERMARKS_MARKLLM_RLIMIT_AS (byte count, hex/octal allowed). POSIX only;
-    on Windows preexec_fn must stay None.
+    WATERMARKS_MARKLLM_RLIMIT_AS overrides DEFAULT_MARKLLM_RLIMIT_AS (byte
+    count, hex/octal allowed); unparsable or non-positive values fall back to
+    the default rather than lifting the cap.
     """
-    raw = os.environ.get("WATERMARKS_MARKLLM_RLIMIT_AS")
-    if not raw or os.name != "posix":
-        return None
+    raw = os.environ.get("WATERMARKS_MARKLLM_RLIMIT_AS", "").strip()
     try:
-        limit = int(raw, 0)
+        limit = int(raw, 0) if raw else DEFAULT_MARKLLM_RLIMIT_AS
     except ValueError:
+        limit = DEFAULT_MARKLLM_RLIMIT_AS
+    return limit if limit > 0 else DEFAULT_MARKLLM_RLIMIT_AS
+
+
+def _markllm_preexec() -> Callable[[], None] | None:
+    """RLIMIT_AS guard for the MarkLLM child (see _markllm_rlimit_as).
+
+    POSIX only; on Windows preexec_fn must stay None.
+    """
+    if os.name != "posix":
         return None
+    limit = _markllm_rlimit_as()
 
     def _apply() -> None:
         import resource
@@ -185,6 +205,7 @@ class MarkLLMTextDetector:
             if self._timeout is not None
             else _env_float("WATERMARKS_MARKLLM_TIMEOUT", DEFAULT_MARKLLM_TIMEOUT)
         )
+        deadline = time.monotonic() + timeout
 
         # Reuse a resident serve worker (WATERMARKS_MARKLLM_PORT) when one is
         # up — avoids a ~20s torch+model cold start per detect. Falls back to
@@ -203,6 +224,41 @@ class MarkLLMTextDetector:
                 }
             except Exception as e:
                 report["error"] = f"MarkLLM worker detect failed ({e}); falling back"
+
+        if not _MARKLLM_CHILD_SLOT.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            report["error"] = "MarkLLM detection busy (another detection is running)"
+            return report
+        try:
+            payload = self._run_child(upstream, scheme, text, deadline, report)
+        finally:
+            _MARKLLM_CHILD_SLOT.release()
+        if payload is None:
+            return report
+        payload["available"] = True
+        payload["detector"] = self.name
+        payload["note"] = (
+            "MarkLLM is a research harness: detection is only valid against the "
+            "same scheme config and keys used at generation; not a vendor detector."
+        )
+        return payload
+
+    def _run_child(
+        self,
+        upstream: str,
+        scheme: str,
+        text: str,
+        deadline: float,
+        report: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """One detect_text_watermark.py run; call only while holding the child slot.
+
+        Returns the parsed JSON payload, or None after recording the failure
+        in report["error"].
+        """
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            report["error"] = "MarkLLM detection timed out"
+            return None
 
         script = Path(__file__).resolve().parent / "detect_text_watermark.py"
         venv_python = _venv_python(Path(upstream).expanduser().resolve())
@@ -224,38 +280,31 @@ class MarkLLMTextDetector:
                     cmd,
                     capture_output=True,
                     text=True,
-                    timeout=timeout,
+                    timeout=remaining,
                     preexec_fn=_markllm_preexec(),
                     check=False,
                     creationflags=subprocess_creationflags,
                 )
             except subprocess.TimeoutExpired:
                 report["error"] = "MarkLLM detection timed out"
-                return report
+                return None
             if r.returncode == 3:
                 report["error"] = (r.stderr or "").strip()[:400] or "MarkLLM unavailable"
-                return report
+                return None
             if r.returncode != 0:
                 report["error"] = (r.stderr or "").strip()[:400] or f"MarkLLM exit {r.returncode}"
-                return report
+                return None
             try:
                 payload = json.loads(r.stdout or "{}")
             except json.JSONDecodeError as e:
                 report["error"] = f"bad MarkLLM JSON: {e}"
-                return report
+                return None
         finally:
             with contextlib.suppress(OSError):
                 Path(tmp).unlink()
-
         if not isinstance(payload, dict):
             report["error"] = "bad MarkLLM response"
-            return report
-        payload["available"] = True
-        payload["detector"] = self.name
-        payload["note"] = (
-            "MarkLLM is a research harness: detection is only valid against the "
-            "same scheme config and keys used at generation; not a vendor detector."
-        )
+            return None
         return payload
 
 

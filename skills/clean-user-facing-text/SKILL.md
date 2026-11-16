@@ -15,11 +15,11 @@ Apply a final text-hygiene pass to prose the user owns or is authorized to proce
    - commands, paths, URLs, identifiers, API names, and exact values
    - formulas, citations, and text the user asks to quote verbatim
 3. Preserve every claim, fact, number, name, citation, and requirement. Never invent a detail, name, number, quote, or source to make the prose easier to write or more varied: if a fact is missing, flag the gap rather than fill it. The rewrite may sharpen, compress, or reorder, but it may not add or remove claims.
-4. **Measure before.** Inspect and score the input with the vendored zero-LLM stylometry estimator (see Scoring) and record the score. Read the report's `density_tier`: rewrite only when it is `high`; for `low` or `medium`, verify the text and otherwise leave the text unchanged. For a flag-only audit that never rewrites, use `--audit`:
+4. **Measure before.** Inspect and score the input with the vendored zero-LLM stylometry estimator (see Scoring) and record the score. Read the report's `density_tier`: rewrite only when it is `high`; for `low` or `medium`, verify the text and otherwise leave the text unchanged. For a flag-only audit that never rewrites, use `--audit`. Bind `src`, `out`, and `final` first (see Passing file paths):
 
    ```bash
-   PYTHON "$SCRIPTS/inspect_text.py" --stylometry --json INPUT
-   PYTHON "$SCRIPTS/inspect_text.py" --audit INPUT  # detect-only: lists flagged spans, no rewrite
+   PYTHON "$SCRIPTS/inspect_text.py" --stylometry --json -- "$src"
+   PYTHON "$SCRIPTS/inspect_text.py" --audit -- "$src"  # detect-only: lists flagged spans, no rewrite
    ```
 
 5. Establish the writing brief before changing prose:
@@ -31,7 +31,7 @@ Apply a final text-hygiene pass to prose the user owns or is authorized to proce
 6. **Layer A — strip artifacts first.** For text artifacts or supplied text files, run the deterministic Unicode pass before rewriting, so the rewrite operates on clean, marker-free text:
 
    ```bash
-   PYTHON "$SCRIPTS/clean_text.py" INPUT -o OUTPUT --stats --no-normalize-spaces
+   PYTHON "$SCRIPTS/clean_text.py" --output="$out" --stats --no-normalize-spaces -- "$src"
    ```
 
 7. **Layer B — rewrite once.** Rewrite the remaining prose once, applying the detector levers (see Detector levers) in order:
@@ -45,7 +45,7 @@ Apply a final text-hygiene pass to prose the user owns or is authorized to proce
 8. **Layer A again.** Run the deterministic Unicode pass on the rewritten result to catch any artifacts the rewrite introduced (smart quotes, em dashes, homoglyphs):
 
    ```bash
-   PYTHON "$SCRIPTS/clean_text.py" OUTPUT -o FINAL --stats --no-normalize-spaces
+   PYTHON "$SCRIPTS/clean_text.py" --output="$final" --stats --no-normalize-spaces -- "$out"
    ```
 
 9. **Measure after.** Score the rewritten text the same way. Report scores and confidence levels when available; otherwise report `status: insufficient_length`. A lower after-score means the measurable signals moved; it is not a verdict from any detector, and it never overrides the fact and voice rules above.
@@ -88,13 +88,37 @@ This skill is self-contained and runs its vendored scripts directly; it has no
 service or network dependency. Deterministic Layer A cleaning below is invoked
 by script, intentionally, so the skill works where the HTTP service is absent.
 
+### Passing file paths
+
+A path is data, never shell source: a file can be named `$(…)`, `a;b`, or
+contain quotes, newlines, or a leading `-`, and no quoting survives every such
+name. So the raw path never appears in a command. Bind each path once from its
+base64 encoding and only ever expand it quoted (`"$src"`, `"$out"`,
+`"$final"`):
+
+```bash
+src=$(printf '%s' 'ZHJhZnQubWQ=' | base64 --decode)
+out=$(printf '%s' 'ZHJhZnQuY2xlYW5lZC5tZA==' | base64 --decode)
+final=$(printf '%s' 'ZHJhZnQuZmluYWwubWQ=' | base64 --decode)
+```
+
+- Replace only each base64 string with the standard base64 of that path's
+  UTF-8 bytes (the examples decode to `draft.md`, `draft.cleaned.md`, and
+  `draft.final.md`). Base64 uses only `A-Z a-z 0-9 + / =`, so the single
+  quotes cannot be closed from inside it. `~` is not expanded.
+- Never put a raw path anywhere in a command, quoted or not, including
+  comments. If a script reports a missing file, re-check the encoding rather
+  than falling back to the raw path.
+- Pass outputs as `--output="$out"` and inputs after `--`, so a leading `-` is
+  not read as an option. For stdin, use `-` without binding.
+
 Inspect first when editing an existing file (include `--stylometry` to record
 the before score):
 
 ```bash
-PYTHON "$SCRIPTS/inspect_text.py" --stylometry --json INPUT
-PYTHON "$SCRIPTS/clean_text.py" INPUT -o OUTPUT --stats --no-normalize-spaces
-PYTHON "$SCRIPTS/inspect_text.py" --stylometry --json OUTPUT
+PYTHON "$SCRIPTS/inspect_text.py" --stylometry --json -- "$src"
+PYTHON "$SCRIPTS/clean_text.py" --output="$out" --stats --no-normalize-spaces -- "$src"
+PYTHON "$SCRIPTS/inspect_text.py" --stylometry --json -- "$out"
 ```
 
 Use `-` for stdin. Prefer a new `*.cleaned.*` output unless the user explicitly requests in-place editing.

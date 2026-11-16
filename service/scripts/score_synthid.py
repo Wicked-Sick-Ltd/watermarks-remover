@@ -9,7 +9,7 @@ scipy, PyWavelets, scikit-learn, Pillow).
 Exit codes:
   0  scored successfully
   1  scorer runtime error
-  2  bad input (missing/unreadable image, bad args)
+  2  bad input (missing/unreadable image, image over the decode pixel limit, bad args)
   3  scorer unavailable (not configured / missing deps / missing codebook)
 
 The scoring logic lives in :func:score_file so the CLI and the HTTP
@@ -25,6 +25,35 @@ import os
 import sys
 from pathlib import Path
 from typing import Any
+
+# Pillow's DecompressionBombError threshold (2 * Image.MAX_IMAGE_PIXELS),
+# applied to the bitmap cv2.imread allocates: IMREAD_COLOR always yields
+# three 8-bit channels, whatever the file declares.
+MAX_DECODED_BYTES = 2 * (1024 * 1024 * 1024 // 4 // 3)
+DECODED_CHANNELS = 3
+MAX_DECODE_PIXELS = MAX_DECODED_BYTES // DECODED_CHANNELS
+_OPENCV_PIXEL_LIMIT_ENV = "OPENCV_IO_MAX_IMAGE_PIXELS"
+
+
+def _limit_opencv_decode_pixels() -> int | None:
+    """Make OpenCV refuse images over MAX_DECODE_PIXELS before allocating them.
+
+    OpenCV reads OPENCV_IO_MAX_IMAGE_PIXELS once, when cv2 is loaded, and
+    every decoder checks width * height against it right after parsing the
+    header the decode will use. A lower operator value is kept. Returns the
+    limit in effect, or None when cv2 is already loaded: the limit it holds
+    is then unknown.
+    """
+    if "cv2" in sys.modules:
+        return None
+    current = os.environ.get(_OPENCV_PIXEL_LIMIT_ENV, "").strip()
+    if current.isdigit() and 0 < int(current) <= MAX_DECODE_PIXELS:
+        return int(current)
+    os.environ[_OPENCV_PIXEL_LIMIT_ENV] = str(MAX_DECODE_PIXELS)
+    return MAX_DECODE_PIXELS
+
+
+_OPENCV_PIXEL_LIMIT = _limit_opencv_decode_pixels()
 
 
 def resolve_upstream(raw: str | None) -> Path | None:
@@ -74,6 +103,14 @@ def score_file(
         print(f"codebook not found: {codebook_path}", file=sys.stderr)
         return 3, None
 
+    if _OPENCV_PIXEL_LIMIT is None:
+        print(
+            "cv2 was loaded before score_synthid could set its decode pixel limit; "
+            "refusing to decode",
+            file=sys.stderr,
+        )
+        return 3, None
+
     sys.path.insert(0, str(extraction))
     try:
         import cv2
@@ -84,7 +121,18 @@ def score_file(
         return 3, None
 
     try:
-        img = cv2.imread(str(path))
+        try:
+            img = cv2.imread(str(path))
+        except Exception as e:
+            if "validateInputImageSize" not in str(e):
+                raise
+            print(
+                f"refusing to decode {path}: image dimensions exceed the decode limit of "
+                f"{_OPENCV_PIXEL_LIMIT} pixels ({DECODED_CHANNELS} channels, "
+                f"{_OPENCV_PIXEL_LIMIT * DECODED_CHANNELS} bytes)",
+                file=sys.stderr,
+            )
+            return 2, None
         if img is None:
             print(f"could not load image: {path}", file=sys.stderr)
             return 2, None

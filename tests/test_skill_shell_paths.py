@@ -92,27 +92,44 @@ def _run_bash(script: str, cwd: Path, env: dict[str, str]) -> subprocess.Complet
     )
 
 
+def _run_clean_blocks(blocks: list[str], cwd: Path, paths: dict[str, str]) -> None:
+    for block in blocks:
+        used = {name: value for name, value in paths.items() if _references(block, name)}
+        result = _run_bash(
+            _agent_script(block, used, {}),
+            cwd=cwd,
+            env={"SCRIPTS": str(CLEAN_SKILL / "scripts")},
+        )
+        # Inspect exits 1 on suspicious input, so a split path shows up only here.
+        assert "cannot read" not in result.stderr, result.stderr
+        assert "error:" not in result.stderr, result.stderr
+    assert not (cwd / CANARY).exists(), "a command smuggled in the file name ran"
+
+
+def _clean_paths(stem: str) -> dict[str, str]:
+    return {"INPUT": f"{stem}.md", "OUTPUT": f"{stem}.cleaned.md", "FINAL": f"{stem}.final.md"}
+
+
+@needs_posix_bash
+def test_clean_block_runner_catches_a_split_inspect_path(tmp_path):
+    paths = _clean_paths("q3 report")
+    (tmp_path / paths["INPUT"]).write_text("Hello\u200b world.\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match=r"cannot read|error:"):
+        _run_clean_blocks(
+            ['PYTHON "$SCRIPTS/inspect_text.py" --stylometry --json $INPUT\n'], tmp_path, paths
+        )
+
+
 @needs_posix_bash
 @pytest.mark.parametrize("stem", HOSTILE_STEMS)
 def test_clean_skill_passes_hostile_file_names_as_one_argument(tmp_path, stem):
-    paths = {
-        "INPUT": f"{stem}.md",
-        "OUTPUT": f"{stem}.cleaned.md",
-        "FINAL": f"{stem}.final.md",
-    }
+    paths = _clean_paths(stem)
     (tmp_path / paths["INPUT"]).write_text("Hello\u200b world.\n", encoding="utf-8")
 
     blocks = [b for b in _bash_blocks(CLEAN_SKILL) if any(_references(b, n) for n in paths)]
     assert blocks
-    for block in blocks:
-        used = {name: value for name, value in paths.items() if _references(block, name)}
-        _run_bash(
-            _agent_script(block, used, {}),
-            cwd=tmp_path,
-            env={"SCRIPTS": str(CLEAN_SKILL / "scripts")},
-        )
+    _run_clean_blocks(blocks, tmp_path, paths)
 
-    assert not (tmp_path / CANARY).exists(), "a command smuggled in the file name ran"
     assert (tmp_path / paths["OUTPUT"]).read_text(encoding="utf-8") == "Hello world.\n"
     assert (tmp_path / paths["FINAL"]).read_text(encoding="utf-8") == "Hello world.\n"
 
@@ -164,13 +181,35 @@ def test_remove_ai_marks_sends_hostile_file_names_as_data(tmp_path, stem):
         assert base64.b64decode(payload["file"]) == content
 
 
+def _unquoted_path_uses(block: str) -> list[str]:
+    found = []
+    for name in PATH_PLACEHOLDERS:
+        found += [f"bare {name}" for _ in _bare(name).finditer(block)]
+        for match in re.finditer(rf"\$(?:\{{{name}\}}|{name}(?!\w))", block):
+            before = block[match.start() - 1 : match.start()]
+            after = block[match.end() : match.end() + 1]
+            if (before, after) != ('"', '"'):
+                found.append(f"unquoted {match.group()}")
+    return found
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        'PYTHON "$SCRIPTS/inspect_text.py" --json $INPUT\n',
+        "$INPUT",
+        'cat "$INPUT" >${OUTPUT}\n',
+        "PYTHON clean_text.py INPUT\n",
+    ],
+)
+def test_quoting_check_flags_unquoted_path_uses(block):
+    assert _unquoted_path_uses(block)
+
+
 @pytest.mark.parametrize("skill", [CLEAN_SKILL, MARKS_SKILL], ids=lambda p: p.name)
 def test_skill_bash_blocks_only_use_quoted_path_variables(skill):
     for block in _bash_blocks(skill):
-        for name in PATH_PLACEHOLDERS:
-            assert not _bare(name).search(block), f"bare {name} placeholder in:\n{block}"
-            for before, after in re.findall(rf"(.)\${name}(.)", block):
-                assert (before, after) == ('"', '"'), f"unquoted ${name} in:\n{block}"
+        assert not _unquoted_path_uses(block), block
 
 
 @pytest.mark.parametrize("skill", [CLEAN_SKILL, MARKS_SKILL], ids=lambda p: p.name)

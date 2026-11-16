@@ -477,7 +477,8 @@ def classify_finding_confidence(finding: str) -> str:
     - confirmed: a recognized provenance structure (C2PA/JUMBF manifest, or a
       parsed field such as digitalSourceType / trainedAlgorithmicMedia).
     - probable: an AI/vendor marker found inside a recognized metadata
-      structure, but not a fully parsed provenance claim.
+      structure, but not a fully parsed provenance claim, or a part whose
+      bytes could not be read at all ("scan inconclusive").
     - informational: context-only notes (CMS generators, presence of an XMP
       packet or customXml parts, unsupported/partial inspection).
     - likely_false_positive: raw whole-file byte scans that can collide with
@@ -495,6 +496,12 @@ def classify_finding_confidence(finding: str) -> str:
     # and only the .md makes the file actionable.
     if t.startswith("layer-a") and t.endswith("(space)"):
         return "informational"
+
+    # A part the scanner could not read cannot be cleared. Reporting it as
+    # context would let the gates pass bytes nothing looked at, so it counts
+    # like a probable finding until it can be inspected.
+    if "scan inconclusive" in t:
+        return "probable"
 
     if any(
         s in t

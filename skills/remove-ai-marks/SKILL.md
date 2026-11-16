@@ -71,6 +71,34 @@ Reports which optional tools are available server-side (`c2patool`, `exiftool`,
 **Drive your advice from this**: only recommend pixel removal / SynthID
 scoring / vendor detection when the service reports the backend present.
 
+### Passing file paths safely
+
+The commands below refer to files only through the shell variables
+`"$INPUT"`, `"$OUTPUT"`, and `"$DIR"`, always inside double quotes. Never paste
+a path into a command in their place, with or without quotes: a file name can
+contain `;`, `|`, `&`, `>`, `$(...)`, backticks, or spaces, and the shell would
+run or split them.
+
+Bind each path once as a single-quoted assignment, then run the commands
+exactly as written:
+
+```bash
+INPUT='drafts/q3 report.md'
+OUTPUT='drafts/q3 report.cleaned.md'
+```
+
+- Refuse a path that contains a quotation mark of any kind (`'`, `"`, or a
+  typographic quote from U+2018 to U+201F), a backslash, a newline, a tab, or
+  any other control character. The file name is also sent inside the JSON
+  payload, so these would break out of it as well. Do not try to escape it:
+  tell the user the name cannot be passed safely and ask them to rename the
+  file or copy it to a plain name.
+- When the host can start a program from an argument list instead of a shell
+  string, prefer that, and pass each path as its own argument.
+- In PowerShell, apply the same rules with PowerShell variables, for example
+  `$InputPath = 'C:\drafts\q3 report.md'`. Do not run these commands through
+  `cmd.exe`.
+
 ## HTTP API (curl)
 
 Payloads are JSON with the file as **base64**. The agent decodes the `cleaned`
@@ -115,21 +143,22 @@ and `/clean` returns 400 if a step's backend/model isn't configured).
 
 ```bash
 curl -s -X POST "${AUTH_HEADER[@]}" "$WM/inspect" -H 'Content-Type: application/json' \
-  -d "{\"file\": \"$(base64 < notes.md | tr -d '\n')\", \"name\": \"notes.md\"}"
+  -d "{\"file\": \"$(base64 < "$INPUT" | tr -d '\n')\", \"name\": \"$(basename -- "$INPUT")\"}"
 ```
 
 **Clean** (text / image / container are auto-detected by name + bytes):
 
 ```bash
 curl -s -X POST "${AUTH_HEADER[@]}" "$WM/clean" -H 'Content-Type: application/json' \
-  -d "{\"file\": \"$(base64 < notes.md | tr -d '\n')\", \"name\": \"notes.md\"}"
+  -d "{\"file\": \"$(base64 < "$INPUT" | tr -d '\n')\", \"name\": \"$(basename -- "$INPUT")\"}"
 ```
 
 Decode the returned `cleaned` base64 into the output file (`*.cleaned.*` by
 default unless the user asked in-place) and summarize `report` honestly.
 
-(On Windows agents, build base64 with
-`[Convert]::ToBase64String([IO.File]::ReadAllBytes("notes.md"))`.)
+(On Windows agents, bind the full path as `$InputPath` (see Passing file paths
+safely) and build base64 with
+`[Convert]::ToBase64String([IO.File]::ReadAllBytes($InputPath))`.)
 
 ## Ethics
 
@@ -155,7 +184,7 @@ mostly just send the file.
 
 ```bash
 curl -s -X POST "${AUTH_HEADER[@]}" "$WM/inspect" -H 'Content-Type: application/json' \
-  -d "{\"file\": \"$(base64 < path | tr -d '\n')\", \"name\": \"$(basename path)\"}"
+  -d "{\"file\": \"$(base64 < "$INPUT" | tr -d '\n')\", \"name\": \"$(basename -- "$INPUT")\"}"
 ```
 
 Show a short summary (suspicious codepoints; C2PA/AI flags; confidence labels
@@ -175,7 +204,7 @@ detecting before and after cleaning:
 
 ```bash
 curl -s -X POST "${AUTH_HEADER[@]}" "$WM/detect" -H 'Content-Type: application/json' \
-  -d '{"file": "'"$(base64 < notes.txt | tr -d '\n')"'", "name": "notes.txt"}'
+  -d "{\"file\": \"$(base64 < "$INPUT" | tr -d '\n')\", \"name\": \"$(basename -- "$INPUT")\"}"
 ```
 
 Or fold detection into the clean: `/clean` with
@@ -191,10 +220,10 @@ the API in Aug 2026 — see `references/vendor-notes.md`.)
 
 ```bash
 curl -s -X POST "${AUTH_HEADER[@]}" "$WM/clean" -H 'Content-Type: application/json' \
-  -d "{\"file\": \"$(base64 < INPUT | tr -d '\n')\", \"name\": \"$(basename INPUT)\"}"
+  -d "{\"file\": \"$(base64 < "$INPUT" | tr -d '\n')\", \"name\": \"$(basename -- "$INPUT")\"}"
 ```
 
-Decode `cleaned` → `OUTPUT` (`*.cleaned.*` unless the user asked in-place).
+Decode `cleaned` → `"$OUTPUT"` (`*.cleaned.*` unless the user asked in-place).
 Re-inspect the result when residual risk matters.
 
 PDF needs `exiftool` + `qpdf` server-side for a real strip; the report notes a
@@ -205,7 +234,7 @@ says the backend is present:
 
 ```bash
 curl -s -X POST "${AUTH_HEADER[@]}" "$WM/clean" -H 'Content-Type: application/json' \
-  -d "{\"file\": \"$(base64 < shot.png | tr -d '\n')\", \"name\": \"shot.png\", \
+  -d "{\"file\": \"$(base64 < "$INPUT" | tr -d '\n')\", \"name\": \"$(basename -- "$INPUT")\", \
        \"options\": {\"remove_pixel\": \"ctrlregen\"}}"
 ```
 
@@ -307,12 +336,13 @@ The service image also ships the audit CLIs. Run them as one-shot containers
 when a directory or website audit is needed:
 
 ```bash
-# Local checkout, or inside the service image:
-docker run --rm -v "$(pwd)/src:/data:ro" watermarks-remover \
+# Local checkout, or inside the service image; bind an absolute directory first:
+docker run --rm -v "$DIR":/data:ro watermarks-remover \
   /app/scripts/audit_dir.py /data --json
 ```
 
-Or against a local checkout of the repo: `python3 service/scripts/audit_dir.py DIR --json`.
+Or against a local checkout of the repo: `python3 service/scripts/audit_dir.py "$DIR" --json`.
+Bind `DIR` the same way as file paths (see Passing file paths safely).
 
 Audit exit codes (same in `--json`, `--sarif` and human output): `0` no
 actionable findings, `1` actionable findings, `2` usage/refusal error,

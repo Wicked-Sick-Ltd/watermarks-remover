@@ -12,6 +12,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -71,17 +72,27 @@ def _agent_script(block: str, paths: dict[str, str], aliases: dict[str, str]) ->
     return preamble + script
 
 
+BASH = shutil.which("bash")
+needs_posix_bash = pytest.mark.skipif(
+    os.name == "nt" or BASH is None,
+    reason="needs bash and POSIX file names (Windows forbids |, > and other test characters)",
+)
+
+
 def _run_bash(script: str, cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess:
+    # The blocks exit non-zero by design when inspect finds suspicious input.
     return subprocess.run(
-        ["bash", "-c", script],
+        [BASH, "-c", script],
         cwd=cwd,
         env={**os.environ, **env},
         text=True,
         capture_output=True,
         timeout=120,
+        check=False,
     )
 
 
+@needs_posix_bash
 @pytest.mark.parametrize("stem", HOSTILE_STEMS)
 def test_clean_skill_passes_hostile_file_names_as_one_argument(tmp_path, stem):
     paths = {
@@ -106,6 +117,7 @@ def test_clean_skill_passes_hostile_file_names_as_one_argument(tmp_path, stem):
     assert (tmp_path / paths["FINAL"]).read_text(encoding="utf-8") == "Hello world.\n"
 
 
+@needs_posix_bash
 @pytest.mark.parametrize("stem", HOSTILE_STEMS)
 def test_remove_ai_marks_sends_hostile_file_names_as_data(tmp_path, stem):
     work = tmp_path / "work"
@@ -125,7 +137,11 @@ def test_remove_ai_marks_sends_hostile_file_names_as_data(tmp_path, stem):
     content = b"Hello\xe2\x80\x8b world.\n"
     (work / name).write_bytes(content)
 
-    blocks = [b for b in _bash_blocks(MARKS_SKILL) if _references(b, "INPUT") or _bare("path").search(b)]
+    blocks = [
+        b
+        for b in _bash_blocks(MARKS_SKILL)
+        if "base64 <" in b and (_references(b, "INPUT") or _bare("path").search(b))
+    ]
     assert blocks
     for block in blocks:
         _run_bash(

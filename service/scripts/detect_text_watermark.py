@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import io
 import json
 import os
 import socket
@@ -39,6 +40,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from common import emit_json, eprint, read_text_input, safe_write_text  # noqa: E402
+from http_guard import IO_WINDOW_SECONDS, paced_reader  # noqa: E402
 
 # Scheme name as the user types it -> MarkLLM algorithm name (config/{ALG}.json).
 # All schemes ship configs in the MarkLLM checkout; SIR additionally needs
@@ -524,7 +526,14 @@ def _serve_socket_server(
 
     class _Handler(socketserver.BaseRequestHandler):
         def handle(self) -> None:
-            f = self.request.makefile("r", encoding="utf-8")
+            reader = paced_reader(self.request)
+            f = io.TextIOWrapper(reader, encoding="utf-8")
+            try:
+                self._serve(f, reader)
+            except TimeoutError:
+                return
+
+        def _serve(self, f: io.TextIOWrapper, reader: io.BufferedReader) -> None:
             for raw in f:
                 line = raw.strip()
                 if not line:
@@ -539,11 +548,13 @@ def _serve_socket_server(
                     with lock:
                         resp = _handle_serve_request(wm, req, threshold)
                 try:
+                    self.request.settimeout(IO_WINDOW_SECONDS)
                     self.request.sendall((json.dumps(resp) + "\n").encode("utf-8"))
                 except OSError:
                     return
                 if isinstance(req, dict) and req.get("op") == "exit":
                     return
+                reader.raw.restart()
 
     class _Server(socketserver.ThreadingTCPServer):
         allow_reuse_address = True

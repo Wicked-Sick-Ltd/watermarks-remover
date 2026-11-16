@@ -31,7 +31,8 @@ the batch. Capped at WATERMARKS_MAX_BATCH_FILES entries per request (default
 size the same as a single-file request.
 
 Hardening mirrors the CLIs: input size caps, binary-as-text guard, atomic
-writes, loopback-only bind by default, optional bearer API key. Run it as an
+writes, loopback-only bind by default, optional bearer API key (required
+when MARKLLM_DIR enables MarkLLM text detection). Run it as an
 unprivileged user (the Docker image does). Intended for a trusted network;
 expose through a reverse proxy if reachable from untrusted clients.
 """
@@ -91,8 +92,15 @@ from text_watermark import (
 VERSION = os.environ.get("WATERMARKS_SERVER_VERSION", "dev")
 
 # Optional bearer token: when set, every request must send
-# `Authorization: Bearer <key>`. Empty means no auth (default).
+# `Authorization: Bearer <key>`. Empty means no auth (default), except when
+# MARKLLM_DIR is set: then every request is refused until a key is configured.
 API_KEY = os.environ.get("WATERMARKS_SERVER_API_KEY", "").strip()
+
+
+def _markllm_enabled() -> bool:
+    """MarkLLM detection loads a language model per call, so it needs the API key."""
+    return bool(os.environ.get("MARKLLM_DIR", "").strip())
+
 
 # Body cap for the JSON envelope. Base64 inflates by 4/3, so the decoded file
 # stays well under MAX_INPUT_BYTES for the same cap.
@@ -1431,7 +1439,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _authorized(self) -> bool:
         if not API_KEY:
-            return True
+            return not _markllm_enabled()
         header = self.headers.get("Authorization", "")
         return header == f"Bearer {API_KEY}"
 
@@ -1706,6 +1714,12 @@ def main() -> int:
         eprint(f"warning: binding {args.host} — intended for a trusted network only")
     if API_KEY:
         eprint("API key required for requests")
+    elif _markllm_enabled():
+        eprint(
+            "error: MARKLLM_DIR is set, so an API key is required "
+            "(set WATERMARKS_SERVER_API_KEY or pass --api-key)"
+        )
+        return 2
     else:
         eprint("warning: no API key set — only bind to loopback or a trusted network")
 

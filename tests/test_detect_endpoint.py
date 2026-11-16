@@ -49,11 +49,14 @@ def _b64(data: bytes) -> str:
 
 
 def _post(conn, path: str, payload: dict) -> tuple[int, dict]:
+    headers = {"Content-Type": "application/json"}
+    if server.API_KEY:
+        headers["Authorization"] = f"Bearer {server.API_KEY}"
     conn.request(
         "POST",
         path,
         body=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
     )
     resp = conn.getresponse()
     data = resp.read()
@@ -134,10 +137,14 @@ def test_detect_text_without_detectors(conn):
 
 
 def _markllm_watermarked(monkeypatch, tmp_path):
-    """Configure the MarkLLM detector with a stubbed subprocess result."""
+    """Configure the MarkLLM detector with a stubbed subprocess result.
+
+    MARKLLM_DIR makes the service require its API key, so a placeholder is set.
+    """
     upstream = tmp_path / "MarkLLM"
     upstream.mkdir()
     monkeypatch.setenv("MARKLLM_DIR", str(upstream))
+    monkeypatch.setattr(server, "API_KEY", "placeholder-api-key")
 
     def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(

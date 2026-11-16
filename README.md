@@ -381,7 +381,7 @@ curl -s -X POST "$WM/clean" -H 'Content-Type: application/json' \
   -d "{\"file\": \"$(base64 < notes.md | tr -d '\n')\", \"name\": \"notes.md\"}"
 ```
 
-The service routes by filename extension then magic bytes, so text / image / container are auto-detected. Set `WATERMARKS_SERVER_API_KEY` to require `Authorization: Bearer <key>` on every request. Loopback-only bind by default (`--host` to override); intended for a trusted network.
+The service routes by filename extension then magic bytes, so text / image / container are auto-detected. Set `WATERMARKS_SERVER_API_KEY` to require `Authorization: Bearer <key>` on every request; it is mandatory when `MARKLLM_DIR` is set (the service refuses to start, and refuses requests, without it). Loopback-only bind by default (`--host` to override); intended for a trusted network.
 
 ### Watermark detection (`/detect` and `detect_before` / `detect_after`)
 

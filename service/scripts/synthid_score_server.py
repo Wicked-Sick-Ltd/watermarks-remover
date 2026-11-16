@@ -25,13 +25,13 @@ import os
 import sys
 import tempfile
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from http_guard import GuardedRequestHandler, ThreadingHTTPServer
 from score_synthid import score_file
 
 VERSION = os.environ.get("WATERMARKS_SYNTHID_SERVER_VERSION", "dev")
@@ -50,7 +50,7 @@ def _json_ok(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
 
-class Handler(BaseHTTPRequestHandler):
+class Handler(GuardedRequestHandler):
     server_version = f"watermarks-remover-synthid/{VERSION}"
 
     def log_message(self, fmt: str, *args: object) -> None:
@@ -69,7 +69,9 @@ class Handler(BaseHTTPRequestHandler):
         if length > MAX_BODY_BYTES:
             return None
         try:
-            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            body = json.loads(self.read_body(length).decode("utf-8"))
+        except TimeoutError:
+            raise
         except (UnicodeDecodeError, json.JSONDecodeError, OSError):
             return None
         return body if isinstance(body, dict) else None

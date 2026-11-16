@@ -59,6 +59,7 @@ COPY scripts/text_detectors.py /app/text_detectors.py
 COPY scripts/detect_gumbel.py /app/detect_gumbel.py
 COPY scripts/text_unicode.py /app/text_unicode.py
 COPY scripts/synthid_text_server.py /app/synthid_text_server.py
+COPY scripts/http_guard.py /app/http_guard.py
 COPY scripts/text_watermark.py /app/text_watermark.py
 
 # Default: CPU torch (like Dockerfile.markdiffusion). CUDA users build with

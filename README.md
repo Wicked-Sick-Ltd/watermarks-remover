@@ -502,6 +502,9 @@ set -a; . ./.env; set +a; python3 service/scripts/rewrite_text.py /tmp/x.txt -o 
 | Var | Reaches | Purpose |
 | --- | --- | --- |
 | `WATERMARKS_SERVER_API_KEY` | `wr-core` (via compose `environment`) | Require `Authorization: Bearer <key>` on the HTTP API |
+| `WATERMARKS_IO_WINDOW_SECONDS` | `wr-core` + sidecars | A request (from accept) or response (from its first byte) must finish or move `WATERMARKS_MIN_TRANSFER_RATE` × this many bytes within each window, or the connection is closed (default 4) |
+| `WATERMARKS_MIN_TRANSFER_RATE` | `wr-core` + sidecars | Minimum sustained bytes/second for request and response transfers (default 16384) |
+| `WATERMARKS_MAX_CONNECTIONS` | `wr-core` + sidecars | Concurrent connection cap, further lowered to fit the open-file limit; at the cap the slowest connection still sending its request is dropped, otherwise newcomers get 503 (default 64) |
 | `WATERMARKS_GEMINI_*` | — | Removed Aug 2026: Google retired SynthID text watermarking on the API (see `vendor-notes.md`) |
 | `WATERMARKS_SYNTHID_SCORER_URL` | `wr-core` | Point core at the `wr-synthid-score` sidecar for SynthID image scoring (e.g. `http://wr-synthid-score:8766` under the heavy profile) |
 | `WATERMARKS_SYNTHID_SCORER_API_KEY` | `wr-core` + `wr-synthid-score` | Shared bearer key for the scorer sidecar (empty = no auth) |

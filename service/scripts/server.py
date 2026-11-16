@@ -51,7 +51,6 @@ import urllib.error
 from datetime import datetime
 from functools import cache
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -78,6 +77,7 @@ from container_meta import (
     inspect_container,
 )
 from format_dispatch import allowlisted_suffix, classify_bytes
+from http_guard import GuardedRequestHandler, ThreadingHTTPServer
 from image_meta import clean_image, inspect_image, run_synthid_score, synthid_is_watermarked
 from score_stylometry import score_text_stylometry
 from text_detectors import detector_status, run_all_text_detectors, run_text_detectors
@@ -1420,7 +1420,7 @@ def _clean_payload(data: bytes, name: str, options: dict[str, Any]) -> dict[str,
     }
 
 
-class Handler(BaseHTTPRequestHandler):
+class Handler(GuardedRequestHandler):
     server_version = f"watermarks-remover/{VERSION}"
 
     def log_message(self, fmt: str, *args: object) -> None:
@@ -1443,7 +1443,9 @@ class Handler(BaseHTTPRequestHandler):
         if length > MAX_BODY_BYTES:
             return None
         try:
-            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            body = json.loads(self.read_body(length).decode("utf-8"))
+        except TimeoutError:
+            raise
         except (UnicodeDecodeError, json.JSONDecodeError, OSError):
             return None
         if not isinstance(body, dict):

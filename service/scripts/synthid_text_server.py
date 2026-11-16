@@ -28,7 +28,6 @@ import sys
 import threading
 from collections import OrderedDict
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -36,6 +35,7 @@ from urllib.parse import urlparse
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+from http_guard import GuardedRequestHandler, ThreadingHTTPServer  # noqa: E402
 from text_watermark import normalize_keys, parse_watermark_options  # noqa: E402
 
 VERSION = os.environ.get("WATERMARKS_SYNTHID_TEXT_SERVER_VERSION", "dev")
@@ -132,7 +132,7 @@ def _generate_watermarked_sample(
     return watermarked, report
 
 
-class Handler(BaseHTTPRequestHandler):
+class Handler(GuardedRequestHandler):
     server_version = f"watermarks-remover-synthid-text/{VERSION}"
 
     def log_message(self, fmt: str, *args: object) -> None:
@@ -151,7 +151,9 @@ class Handler(BaseHTTPRequestHandler):
         if length > MAX_BODY_BYTES:
             return None
         try:
-            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            body = json.loads(self.read_body(length).decode("utf-8"))
+        except TimeoutError:
+            raise
         except (UnicodeDecodeError, json.JSONDecodeError, OSError):
             return None
         return body if isinstance(body, dict) else None

@@ -111,25 +111,56 @@ list such as `"paraphrase@0.8,mlm@0.2"` that runs the Layer B rewrite after
 Layer A; when omitted the default from `config/clean_strategy.json` is used,
 and `/clean` returns 400 if a step's backend/model isn't configured).
 
+**Passing a file path.** A path is data, never shell source: a downloaded file
+can be named `$(…)`, `a;b`, or contain quotes or newlines, and no quoting or
+heredoc survives every such name. So the raw path never appears in a command.
+Every recipe below binds it once from its base64 encoding and only ever expands
+it as `"$src"`:
+
+- Replace only the base64 string in `src=$(printf '%s' '…' | base64 --decode)`
+  with the standard base64 of the path's UTF-8 bytes (the example decodes to
+  `notes.md`). Base64 uses only `A-Z a-z 0-9 + / =`, so the single quotes
+  cannot be closed from inside it. Use an absolute or working-directory
+  relative path; `~` is not expanded.
+- Never put the raw path anywhere in a command: not in `base64 <`,
+  `basename`, `$(…)`, the JSON body, a comment, or any kind of quotes.
+- If `base64` reports that the file does not exist, re-check the encoding
+  rather than falling back to the raw path.
+- The `name` sent to the service is the basename reduced to
+  `A-Z a-z 0-9 . _ -` (the service only uses its extension), so it cannot break
+  out of the JSON string.
+- Bind an output path the same way before writing to it, and only expand it
+  quoted.
+
 **Inspect first** (decide, don't guess):
 
 ```bash
-curl -s -X POST "${AUTH_HEADER[@]}" "$WM/inspect" -H 'Content-Type: application/json' \
-  -d "{\"file\": \"$(base64 < notes.md | tr -d '\n')\", \"name\": \"notes.md\"}"
+src=$(printf '%s' 'bm90ZXMubWQ=' | base64 --decode)
+name=$(printf '%s' "${src##*/}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')
+{ printf '{"file": "'; base64 < "$src" | tr -d '\n'; printf '", "name": "%s"}' "$name"; } |
+  curl -s -X POST "${AUTH_HEADER[@]}" "$WM/inspect" -H 'Content-Type: application/json' --data-binary @-
 ```
 
 **Clean** (text / image / container are auto-detected by name + bytes):
 
 ```bash
-curl -s -X POST "${AUTH_HEADER[@]}" "$WM/clean" -H 'Content-Type: application/json' \
-  -d "{\"file\": \"$(base64 < notes.md | tr -d '\n')\", \"name\": \"notes.md\"}"
+src=$(printf '%s' 'bm90ZXMubWQ=' | base64 --decode)
+name=$(printf '%s' "${src##*/}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')
+{ printf '{"file": "'; base64 < "$src" | tr -d '\n'; printf '", "name": "%s"}' "$name"; } |
+  curl -s -X POST "${AUTH_HEADER[@]}" "$WM/clean" -H 'Content-Type: application/json' --data-binary @-
 ```
 
 Decode the returned `cleaned` base64 into the output file (`*.cleaned.*` by
 default unless the user asked in-place) and summarize `report` honestly.
 
-(On Windows agents, build base64 with
-`[Convert]::ToBase64String([IO.File]::ReadAllBytes("notes.md"))`.)
+On Windows agents, bind the path from its base64 the same way (PowerShell
+expands `$(…)` inside double-quoted strings) and build base64 from the
+variable:
+
+```powershell
+$src = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('bm90ZXMubWQ='))
+[Convert]::ToBase64String([IO.File]::ReadAllBytes($src))
+```
 
 ## Ethics
 
@@ -153,9 +184,13 @@ mostly just send the file.
 
 ### 2. Inspect first
 
+Bind the path as described under "Passing a file path" above:
+
 ```bash
-curl -s -X POST "${AUTH_HEADER[@]}" "$WM/inspect" -H 'Content-Type: application/json' \
-  -d "{\"file\": \"$(base64 < path | tr -d '\n')\", \"name\": \"$(basename path)\"}"
+src=$(printf '%s' 'cGF0aC90by9maWxl' | base64 --decode)
+name=$(printf '%s' "${src##*/}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')
+{ printf '{"file": "'; base64 < "$src" | tr -d '\n'; printf '", "name": "%s"}' "$name"; } |
+  curl -s -X POST "${AUTH_HEADER[@]}" "$WM/inspect" -H 'Content-Type: application/json' --data-binary @-
 ```
 
 Show a short summary (suspicious codepoints; C2PA/AI flags; confidence labels
@@ -174,8 +209,10 @@ scorer (`scorers.synthid_http` / `scorers.synthid`), measure the result by
 detecting before and after cleaning:
 
 ```bash
-curl -s -X POST "${AUTH_HEADER[@]}" "$WM/detect" -H 'Content-Type: application/json' \
-  -d '{"file": "'"$(base64 < notes.txt | tr -d '\n')"'", "name": "notes.txt"}'
+src=$(printf '%s' 'bm90ZXMudHh0' | base64 --decode)
+name=$(printf '%s' "${src##*/}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')
+{ printf '{"file": "'; base64 < "$src" | tr -d '\n'; printf '", "name": "%s"}' "$name"; } |
+  curl -s -X POST "${AUTH_HEADER[@]}" "$WM/detect" -H 'Content-Type: application/json' --data-binary @-
 ```
 
 Or fold detection into the clean: `/clean` with
@@ -190,11 +227,14 @@ the API in Aug 2026 — see `references/vendor-notes.md`.)
 **Any supported file (unified):**
 
 ```bash
-curl -s -X POST "${AUTH_HEADER[@]}" "$WM/clean" -H 'Content-Type: application/json' \
-  -d "{\"file\": \"$(base64 < INPUT | tr -d '\n')\", \"name\": \"$(basename INPUT)\"}"
+src=$(printf '%s' 'cGF0aC90by9pbnB1dA==' | base64 --decode)
+name=$(printf '%s' "${src##*/}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')
+{ printf '{"file": "'; base64 < "$src" | tr -d '\n'; printf '", "name": "%s"}' "$name"; } |
+  curl -s -X POST "${AUTH_HEADER[@]}" "$WM/clean" -H 'Content-Type: application/json' --data-binary @-
 ```
 
-Decode `cleaned` → `OUTPUT` (`*.cleaned.*` unless the user asked in-place).
+Decode `cleaned` → the output file (`*.cleaned.*` unless the user asked
+in-place), binding that path the same way.
 Re-inspect the result when residual risk matters.
 
 PDF needs `exiftool` + `qpdf` server-side for a real strip; the report notes a
@@ -204,9 +244,11 @@ degraded (best-effort) result when either is missing — check `/capabilities`.
 says the backend is present:
 
 ```bash
-curl -s -X POST "${AUTH_HEADER[@]}" "$WM/clean" -H 'Content-Type: application/json' \
-  -d "{\"file\": \"$(base64 < shot.png | tr -d '\n')\", \"name\": \"shot.png\", \
-       \"options\": {\"remove_pixel\": \"ctrlregen\"}}"
+src=$(printf '%s' 'c2hvdC5wbmc=' | base64 --decode)
+name=$(printf '%s' "${src##*/}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')
+{ printf '{"file": "'; base64 < "$src" | tr -d '\n'
+  printf '", "name": "%s", "options": {"remove_pixel": "ctrlregen"}}' "$name"; } |
+  curl -s -X POST "${AUTH_HEADER[@]}" "$WM/clean" -H 'Content-Type: application/json' --data-binary @-
 ```
 
 ### 4. Layer B — always offer rewrite (prose)
@@ -306,13 +348,18 @@ Avoid formulaic transitions. Do not omit any bullet. Output only the document.
 The service image also ships the audit CLIs. Run them as one-shot containers
 when a directory or website audit is needed:
 
+Bind the directory as described under "Passing a file path" (stop if it
+contains `:`, which Docker reads as a volume separator):
+
 ```bash
-# Local checkout, or inside the service image:
-docker run --rm -v "$(pwd)/src:/data:ro" watermarks-remover \
-  /app/scripts/audit_dir.py /data --json
+dir=$(printf '%s' 'c3Jj' | base64 --decode)
+dir=$(CDPATH= cd -- "$dir" && pwd -P) &&
+  docker run --rm -v "$dir:/data:ro" watermarks-remover \
+    /app/scripts/audit_dir.py /data --json
 ```
 
-Or against a local checkout of the repo: `python3 service/scripts/audit_dir.py DIR --json`.
+Or against a local checkout of the repo, with `dir` bound the same way:
+`python3 service/scripts/audit_dir.py --json -- "$dir"`.
 
 Audit exit codes (same in `--json`, `--sarif` and human output): `0` no
 actionable findings, `1` actionable findings, `2` usage/refusal error,

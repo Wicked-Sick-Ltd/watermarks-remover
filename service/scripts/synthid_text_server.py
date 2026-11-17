@@ -36,7 +36,11 @@ from urllib.parse import urlparse
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from text_watermark import normalize_keys, parse_watermark_options  # noqa: E402
+from text_watermark import (  # noqa: E402
+    normalize_keys,
+    parse_watermark_options,
+    resolve_text_model,
+)
 
 VERSION = os.environ.get("WATERMARKS_SYNTHID_TEXT_SERVER_VERSION", "dev")
 
@@ -65,7 +69,7 @@ def _generate_watermarked_sample(
     """Generate watermarked text using MarkLLM."""
     opts = options or {}
     scheme = opts.get("scheme", "synthid").lower()
-    model_name = opts.get("model", DEFAULT_MODEL)
+    model_name = resolve_text_model(opts.get("model"), DEFAULT_MODEL)
     seed = opts.get("seed")
     max_new_tokens = int(opts.get("max_new_tokens", 200))
     min_length = int(opts.get("min_length", 0))
@@ -222,7 +226,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError(f"'text' exceeds input size cap ({MAX_INPUT_BYTES} bytes)")
 
         keys = normalize_keys(entry.get("keys"))
-        options = parse_watermark_options(entry.get("options"))
+        options = parse_watermark_options(entry.get("options"), default_model=DEFAULT_MODEL)
         return text, keys, options
 
     def _handle_single(self, body: dict[str, Any]) -> None:

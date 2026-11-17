@@ -290,7 +290,7 @@ Optional system tools (auto-used when present — preinstalled in the core Docke
 
 | Tool | Role |
 | --- | --- |
-| [`c2patool`](https://github.com/contentauth/c2pa-rs/tree/main/cli) | Inspect C2PA manifests |
+| [`c2patool`](https://github.com/contentauth/c2pa-rs/tree/main/cli) | Inspect C2PA manifests (always run offline: remote-manifest, OCSP and other network lookups are disabled) |
 | [`exiftool`](https://exiftool.org/) | Residual metadata strip (esp. **PDF**) |
 | [`qpdf`](https://qpdf.sourceforge.io/) | Structural PDF rebuild — **required** for a real PDF strip (see below) |
 
@@ -1337,6 +1337,7 @@ v0.7.0 brings the Layer B statistical-mark rewrite into the `/clean` service its
 
 ### Unreleased
 
+- **c2patool runs offline**: image and PDF inspection pass c2patool a settings file that disables remote-manifest fetching and OCSP and allows no network hosts, so an inspected file's XMP `dcterms:provenance` URL is reported, not requested.
 - **OOXML add-in metadata**: inspect Office web-extension vendor properties and references in DOCX, XLSX, and PPTX, then remove their package parts and dangling relationships; refuse cleaning while a matching Office owner file exists.
 - Pre-commit clean hook (`watermarks-remover-clean` / `clean_staged.py`): use content digests (`SHA-256`) and active action detection so clean files on disk are recognized without demanding infinite re-staging (#173)
 - **OOXML container preservation**: keep `<AppVersion>` intact in `docProps/app.xml` during DOCX, XLSX, and PPTX metadata cleaning to satisfy ECMA-376 schema constraints and avoid Microsoft Word/Office "unreadable content" errors (#283)

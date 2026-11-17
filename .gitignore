@@ -41,9 +41,12 @@
 !/stealer/
 !/stealer/**
 !/.cursor/
-!/.cursor/install.sh
-!/.cursor/start.sh
+.cursor/*
 !/.cursor/environment.json
+!/.cursor/health.sh
+!/.cursor/install.sh
+!/.cursor/serve.sh
+!/.cursor/start.sh
 
 # Exceptions even inside allowed trees
 .env

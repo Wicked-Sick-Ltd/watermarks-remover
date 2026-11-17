@@ -5,8 +5,8 @@
   "terminals": [
     {
       "name": "http",
-      "command": ".venv/bin/python service/scripts/server.py --host 127.0.0.1 --port 8765",
-      "description": "Core HTTP service. GET /health on port 8765."
+      "command": "bash .cursor/serve.sh",
+      "description": "Core HTTP service on port 8765. Follows the log when start.sh already launched it."
     }
   ],
   "ports": [

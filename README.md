@@ -1243,7 +1243,7 @@ bash .cursor/install.sh
 .venv/bin/python -m ruff format --check service tests
 ```
 
-On boot, the `http` terminal runs `service/scripts/server.py` at `http://127.0.0.1:8765`. `GET /health` returns 200. `WATERMARKS_SERVER_API_KEY` is required only when `MARKLLM_DIR` is set. `HF_TOKEN` is required only to download gated Hugging Face models, which the cloud install does not do.
+On boot, `.cursor/start.sh` launches the HTTP service, then waits until `GET /health` on `http://127.0.0.1:8765` returns 200. When `WATERMARKS_SERVER_API_KEY` is set, that probe sends it as a bearer token. The `http` terminal runs the same serve script and follows the log if the service is already up. `WATERMARKS_SERVER_API_KEY` is required only when `MARKLLM_DIR` is set. `HF_TOKEN` is required only to download gated Hugging Face models, which the cloud install does not do.
 
 ## Changelog
 

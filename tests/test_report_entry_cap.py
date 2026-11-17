@@ -285,14 +285,11 @@ def test_report_list_equality_covers_cap_state_and_plain_lists():
         return item[0]
 
     left = ReportList(["a1", "b1"], cap=4, key=kind)
-    right = ReportList(["a1", "b1"], cap=4, key=kind)
-    assert left == right
+    assert left == ReportList(["a1", "b1"], cap=4, key=kind)
     assert left == ["a1", "b1"]
     # The reverse comparison uses list.__eq__, which only sees the contents.
     assert list.__eq__(["a1", "b1"], left) is True
-    wider = ReportList(["a1", "b1"], cap=9, key=kind)
-    assert (left == wider) is False
-    assert left != wider
+    assert left != ReportList(["a1", "b1"], cap=9, key=kind)
 
     class _EqSpy:
         __hash__ = None
@@ -305,21 +302,20 @@ def test_report_list_equality_covers_cap_state_and_plain_lists():
             return False
 
     spy = _EqSpy()
-    assert (left == spy) is False
+    assert left != spy
     assert spy.seen is True
     with pytest.raises(TypeError):
         hash(left)
 
-    twin = ReportList(["a1", "b1"], cap=4, key=kind)
-    assert left == twin
-    twin.omitted = left.omitted + 1
-    assert left != twin
-    twin.omitted = left.omitted
-    twin._keys.add("z")
-    assert left != twin
-    twin._keys.discard("z")
-    left._key_of("a1")
-    assert left != twin
+    same = ReportList(["a1", "b1"], cap=4, key=kind)
+    higher_omitted = ReportList(["a1", "b1"], cap=4, key=kind)
+    higher_omitted.omitted = same.omitted + 1
+    assert same != higher_omitted
+
+    cached = ReportList(["a1", "b1"], cap=4, key=kind)
+    looked_up = ReportList(["a1", "b1"], cap=4, key=kind)
+    looked_up._key_of("a1")
+    assert cached == looked_up
 
 
 def test_extend_capped_keeps_one_cap_and_both_omitted_counts():

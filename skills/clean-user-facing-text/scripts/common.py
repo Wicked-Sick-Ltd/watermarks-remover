@@ -79,12 +79,12 @@ class ReportList(list):
         # that list equality would ignore. Anything else is left to the other
         # operand.
         if isinstance(other, ReportList):
+            # ``_last`` is only a lookup cache, so it is not part of equality.
             return list.__eq__(self, other) is True and (
                 self.cap == other.cap
                 and self.key == other.key
                 and self.omitted == other.omitted
                 and self._keys == other._keys
-                and self._last == other._last
             )
         if isinstance(other, list):
             return list.__eq__(self, other) is True

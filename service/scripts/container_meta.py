@@ -4711,7 +4711,9 @@ def clean_container(
 
     data = path.read_bytes()
     fmt = fmt or detect_container_format(path, data)
-    actions = actions_list()
+    # Each format branch assigns this. An empty actions_list() here is a dead
+    # store: every path overwrites it, or raises, before the result is read.
+    actions: list[str]
     if fmt in {"docx", "xlsx", "pptx"}:
         owner_file = office_owner_file(path)
         if owner_file is not None:

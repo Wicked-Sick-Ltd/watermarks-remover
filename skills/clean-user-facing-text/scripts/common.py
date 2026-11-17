@@ -47,6 +47,9 @@ class ReportList(list):
     starts with "no " so action filters read it as a non-change.
     """
 
+    # Mutable, like list. Equality is explicit so the cap state below participates.
+    __hash__ = None
+
     def __init__(
         self,
         iterable: Any = (),
@@ -70,6 +73,45 @@ class ReportList(list):
             (list(self), self.cap, self.key, self.omitted, set(self._keys)),
         )
 
+    def __eq__(self, other: object) -> bool:
+        # A plain list compares by contents only, so existing `entries == [...]`
+        # checks keep working. Another ReportList also compares the cap state
+        # that list equality would ignore. Anything else is left to the other
+        # operand.
+        if isinstance(other, ReportList):
+            return list.__eq__(self, other) is True and (
+                self.cap == other.cap
+                and self.key == other.key
+                and self.omitted == other.omitted
+                and self._keys == other._keys
+                and self._last == other._last
+            )
+        if isinstance(other, list):
+            return list.__eq__(self, other) is True
+        return NotImplemented
+
+    def __ne__(self, other: object) -> bool:
+        # list.__ne__ only compares contents. Inverting __eq__ keeps != aligned
+        # with the cap state that __eq__ now includes.
+        equal = self.__eq__(other)
+        if equal is NotImplemented:
+            return NotImplemented
+        return not equal
+
+    def _summary(self) -> str:
+        return f"no further entries listed: {self.omitted} omitted (report capped at {self.cap})"
+
+    def _note_omitted(self, count: int) -> None:
+        if count <= 0:
+            return
+        had_summary = self.omitted > 0
+        self.omitted += count
+        summary = self._summary()
+        if had_summary:
+            self[-1] = summary
+        else:
+            super().append(summary)
+
     def _key_of(self, item: Any) -> Hashable:
         if self.key is None:
             return None
@@ -92,12 +134,7 @@ class ReportList(list):
             else:
                 super().append(item)
             return
-        self.omitted += 1
-        summary = f"no further entries listed: {self.omitted} omitted (report capped at {self.cap})"
-        if self.omitted == 1:
-            super().append(summary)
-        else:
-            self[-1] = summary
+        self._note_omitted(1)
 
     def extend(self, iterable: Any) -> None:
         for item in iterable:
@@ -106,6 +143,26 @@ class ReportList(list):
     def __iadd__(self, iterable: Any) -> ReportList:
         self.extend(iterable)
         return self
+
+    def extend_capped(self, other: Any) -> None:
+        """Append *other* so two capped reports stay under this list's one cap.
+
+        ``left + right`` builds a plain list, so each side keeps its own
+        omitted summary and the cap applies twice. Stored entries are
+        appended (the other list's summary line is not) and its omitted
+        count is added to this one.
+        """
+        extra = 0
+        if isinstance(other, ReportList):
+            items = list(other)
+            extra = other.omitted
+            if extra and items:
+                items = items[:-1]
+        else:
+            items = list(other)
+        for item in items:
+            self.append(item)
+        self._note_omitted(extra)
 
     def insert(self, index: Any, item: Any) -> None:
         if not self.omitted and len(self) < self.cap:

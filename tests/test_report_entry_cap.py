@@ -278,6 +278,119 @@ def test_capped_markdown_findings_keep_late_c2pa_hint():
     assert has_c2pa is True
 
 
+def test_report_list_equality_covers_cap_state_and_plain_lists():
+    from common import ReportList
+
+    def kind(item: str) -> str:
+        return item[0]
+
+    left = ReportList(["a1", "b1"], cap=4, key=kind)
+    right = ReportList(["a1", "b1"], cap=4, key=kind)
+    assert left == right
+    assert left == ["a1", "b1"]
+    # The reverse comparison uses list.__eq__, which only sees the contents.
+    assert list.__eq__(["a1", "b1"], left) is True
+    wider = ReportList(["a1", "b1"], cap=9, key=kind)
+    assert (left == wider) is False
+    assert left != wider
+
+    class _EqSpy:
+        __hash__ = None
+
+        def __init__(self) -> None:
+            self.seen = False
+
+        def __eq__(self, other: object) -> bool:
+            self.seen = True
+            return False
+
+    spy = _EqSpy()
+    assert (left == spy) is False
+    assert spy.seen is True
+    with pytest.raises(TypeError):
+        hash(left)
+
+    twin = ReportList(["a1", "b1"], cap=4, key=kind)
+    assert left == twin
+    twin.omitted = left.omitted + 1
+    assert left != twin
+    twin.omitted = left.omitted
+    twin._keys.add("z")
+    assert left != twin
+    twin._keys.discard("z")
+    left._key_of("a1")
+    assert left != twin
+
+
+def test_extend_capped_keeps_one_cap_and_both_omitted_counts():
+    from common import ReportList
+
+    left = ReportList(cap=2, key=lambda item: item[0])
+    right = ReportList(cap=2, key=left.key)
+    left.extend(["a1", "a2", "a3", "b1"])
+    right.extend(["a9", "c1", "c2", "d1"])
+    merged = ReportList(cap=2, key=left.key)
+    merged.extend_capped(left)
+    merged.extend_capped(right)
+    summaries = [item for item in merged if str(item).startswith("no further entries listed")]
+    assert summaries == [merged[-1]]
+    assert len(merged) <= 2 + 4 + 1
+    assert merged.omitted >= left.omitted + right.omitted
+    assert "b1" in merged
+    assert "d1" in merged
+
+
+def _isobmff_box(fourcc: bytes, payload: bytes) -> bytes:
+    return struct.pack(">I", len(payload) + 8) + fourcc + payload
+
+
+def _mp4_with_jumb_and_udta(n: int) -> bytes:
+    ftyp = _isobmff_box(b"ftyp", b"isom" + struct.pack(">I", 0) + b"isomiso2mp41")
+    jumb = _isobmff_box(b"jumb", b"")
+    udta = _isobmff_box(b"udta", b"c2pa")
+    mvhd = _isobmff_box(b"mvhd", b"\x00" * 20)
+    moov = _isobmff_box(b"moov", mvhd + udta * n)
+    return ftyp + jumb * n + moov
+
+
+def test_mp4_merged_walks_share_one_report_cap():
+    from common import MAX_REPORT_ENTRIES
+
+    data = _mp4_with_jumb_and_udta(MAX_REPORT_ENTRIES + 50)
+    _has_c2pa, _has_ai, findings = av_meta._inspect_mp4(data)
+    finding_summaries = [
+        item for item in findings if str(item).startswith("no further entries listed")
+    ]
+    assert len(finding_summaries) == 1
+    assert len(findings) <= MAX_REPORT_ENTRIES + 8
+    omitted = int(str(finding_summaries[0]).split()[4])
+    assert omitted > MAX_REPORT_ENTRIES
+
+    cleaned, actions, _incomplete = av_meta._strip_mp4(data, strip_all_metadata=True)
+    action_summaries = [
+        item for item in actions if str(item).startswith("no further entries listed")
+    ]
+    assert len(action_summaries) == 1
+    assert len(actions) <= MAX_REPORT_ENTRIES + 8
+    assert b"jumb" not in cleaned
+    assert b"udta" not in cleaned
+
+
+def test_mp4_merge_keeps_both_walks_when_under_the_cap():
+    data = _mp4_with_jumb_and_udta(1)
+    _has_c2pa, has_ai, findings = av_meta._inspect_mp4(data)
+    assert has_ai is True
+    assert any("top-level box jumb" in item for item in findings)
+    assert any("moov/udta" in item for item in findings)
+    assert not any(str(item).startswith("no further entries listed") for item in findings)
+
+    cleaned, actions, _incomplete = av_meta._strip_mp4(data, strip_all_metadata=True)
+    assert any("top-level jumb" in item for item in actions)
+    assert any("moov/udta" in item for item in actions)
+    assert b"jumb" not in cleaned
+    assert b"udta" not in cleaned
+
+
 def test_capped_actions_keep_late_mutating_action():
     from common import actions_list, result_has_changes
 

@@ -142,7 +142,12 @@ def _strip_moov_udta(data: bytes, *, strip_all_metadata: bool) -> tuple[bytes, l
 def _inspect_mp4(data: bytes) -> tuple[bool, bool, list[str]]:
     has_c2pa, has_ai, findings = inspect_isobmff(data, fmt="mp4")
     udta_c2pa, udta_ai, udta_findings = _inspect_moov_udta(data)
-    return has_c2pa or udta_c2pa, has_ai or udta_ai, findings + udta_findings
+    # `+` would concatenate two already-capped lists into a plain list and
+    # keep both omitted summaries. Folding applies the cap once.
+    merged = findings_list()
+    merged.extend_capped(findings)
+    merged.extend_capped(udta_findings)
+    return has_c2pa or udta_c2pa, has_ai or udta_ai, merged
 
 
 def _strip_mp4(data: bytes, *, strip_all_metadata: bool) -> tuple[bytes, list[str], bool]:
@@ -150,10 +155,19 @@ def _strip_mp4(data: bytes, *, strip_all_metadata: bool) -> tuple[bytes, list[st
     cleaned, udta_actions, inspection_incomplete = _strip_moov_udta(
         cleaned, strip_all_metadata=strip_all_metadata
     )
-    actions = [a for a in actions if not a.startswith("no MP4 metadata")] + udta_actions
-    if not actions:
-        actions = ["no MP4 metadata boxes removed (already clean or none matched)"]
-    return cleaned, actions, inspection_incomplete
+    merged = actions_list()
+    merged.extend_capped(actions)
+    # strip_isobmff's "already clean" notice is the whole list only when that
+    # walk removed nothing. Drop it before folding udta actions, and put it
+    # back only when udta removed nothing either.
+    if merged.omitted == 0 and all(
+        isinstance(item, str) and item.startswith("no MP4 metadata") for item in merged
+    ):
+        merged = actions_list()
+    merged.extend_capped(udta_actions)
+    if not merged:
+        merged.append("no MP4 metadata boxes removed (already clean or none matched)")
+    return cleaned, merged, inspection_incomplete
 
 
 # ---------------------------------------------------------------------------

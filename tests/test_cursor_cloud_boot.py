@@ -242,4 +242,5 @@ def test_c2patool_pin_rejects_a_different_version_on_path(tmp_path: Path) -> Non
     assert "0.27.14" in result.stderr
     assert "0.27.15" in result.stderr
     assert "c2patool-v0.27.15" in result.stderr
-    assert str(tmp_path / "bin" / "c2patool") in result.stderr
+    # Git Bash on Windows prints /c/Users/... while pathlib uses C:\Users\...
+    assert "bin/c2patool" in result.stderr.replace("\\", "/")

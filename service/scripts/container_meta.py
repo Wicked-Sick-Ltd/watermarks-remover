@@ -570,21 +570,20 @@ def _iter_tag_blocks(text, open_re, close_re):
     """Yield (open_start, open_end, close_start, close_end) for each block.
 
     Works on str and bytes alike. Linear in len(text): closing tags are
-    collected once with finditer and consumed by a forward pointer, so an
-    unbounded run of unclosed opening tags costs one pass, not one rescan per
-    opening tag.
+    consumed lazily by a forward pointer, so an unbounded run of unclosed
+    opening tags costs one pass, not one rescan per opening tag, and memory
+    stays constant however many blocks the text holds.
     """
-    closes = list(close_re.finditer(text))
-    ci = 0
+    closes = close_re.finditer(text)
+    cm = next(closes, None)
     last_end = 0
     for om in open_re.finditer(text):
         if om.start() < last_end:
             continue
-        while ci < len(closes) and closes[ci].start() < om.end():
-            ci += 1
-        if ci >= len(closes):
+        while cm is not None and cm.start() < om.end():
+            cm = next(closes, None)
+        if cm is None:
             return
-        cm = closes[ci]
         yield om.start(), om.end(), cm.start(), cm.end()
         last_end = cm.end()
 
@@ -671,17 +670,43 @@ def _md_prose_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _provenance_comments(text: str, spans: list[tuple[int, int]] | None = None) -> list[str]:
-    """Return the provenance comment blocks found inside spans (default: all)."""
-    found: list[str] = []
+def _provenance_comments(text: str, spans: list[tuple[int, int]] | None = None) -> Iterator[str]:
+    """Yield the provenance comment blocks found inside spans (default: all)."""
     for a, b in spans if spans is not None else [(0, len(text))]:
         seg = text[a:b]
         for os_, _oe, _cs, ce in _iter_tag_blocks(
             seg, _MARKUP_COMMENT_OPEN_RE, _MARKUP_COMMENT_CLOSE_RE
         ):
             if _comment_is_provenance(seg[os_:ce]):
-                found.append(seg[os_:ce])
-    return found
+                yield seg[os_:ce]
+
+
+# Markup inspectors report one finding per matching comment/tag/attribute. An
+# upload can repeat a short match millions of times, so only the first few of
+# each kind are kept verbatim and the rest are summarised as a count.
+_MAX_FINDINGS_PER_KIND = 20
+
+
+class _FindingSampler:
+    """Append up to _MAX_FINDINGS_PER_KIND findings of one kind, count the rest."""
+
+    def __init__(self, findings: list[str], prefix: str, noun: str) -> None:
+        self._findings = findings
+        self._prefix = prefix
+        self._noun = noun
+        self.total = 0
+
+    def add(self, detail: str) -> None:
+        self.total += 1
+        if self.total <= _MAX_FINDINGS_PER_KIND:
+            self._findings.append(f"{self._prefix}: {detail}")
+
+    def close(self) -> None:
+        extra = self.total - _MAX_FINDINGS_PER_KIND
+        if extra > 0:
+            self._findings.append(
+                f"{self._prefix}: {extra} more {self._noun} not listed ({self.total} total)"
+            )
 
 
 def _drop_provenance_comments(
@@ -810,9 +835,16 @@ def inspect_markdown(text: str) -> tuple[bool, bool, list[str], dict]:
                 has_ai = True
                 note(f"frontmatter value hit on {key}")
 
+    comment_c2pa = False
+    comments = _FindingSampler(findings, "comment", "provenance comments")
     for block in _provenance_comments(text, _md_prose_spans(text)):
         has_ai = True
-        note(f"comment: {block[:120]}")
+        sample = block[:120]
+        comments.add(sample)
+        if not comment_c2pa:
+            low = sample.lower()
+            comment_c2pa = "c2pa" in low or "content" in low
+    comments.close()
 
     uri_c2pa, uri_ai, uri_findings = _inspect_embedded_data_uris(text)
     if uri_c2pa:
@@ -822,7 +854,7 @@ def inspect_markdown(text: str) -> tuple[bool, bool, list[str], dict]:
     for finding in uri_findings:
         note(finding)
 
-    c2pa = uri_c2pa or c2pa_hint
+    c2pa = uri_c2pa or c2pa_hint or comment_c2pa
     return c2pa, has_ai, findings, {"has_frontmatter": has_fm, "keys": keys}
 
 
@@ -1664,15 +1696,20 @@ def inspect_html(text: str) -> tuple[bool, bool, list[str], dict]:
     findings = findings_list()
     has_ai = False
     has_c2pa = False
-    for tag in _META_TAG_RE.findall(text):
+    cms_metas = _FindingSampler(findings, "info: cms generator", "generator meta tags")
+    ai_metas = _FindingSampler(findings, "meta", "AI meta tags")
+    for tm in _META_TAG_RE.finditer(text):
+        tag = tm.group(0)
         if re.search(r"c2pa|content.?credential", tag, re.I):
             has_c2pa = True
         if _is_cms_generator_meta(tag):
-            findings.append(f"info: cms generator: {tag[:120]}")
+            cms_metas.add(tag[:120])
             continue
         if _meta_tag_is_ai(tag):
             has_ai = True
-            findings.append(f"meta: {tag[:120]}")
+            ai_metas.add(tag[:120])
+    cms_metas.close()
+    ai_metas.close()
     for os_, oe, _cs, ce in _iter_script_blocks(text):
         if not _script_tag_is_jsonld(text[os_:oe]):
             continue
@@ -1684,17 +1721,21 @@ def inspect_html(text: str) -> tuple[bool, bool, list[str], dict]:
             findings.append("json-ld provenance-like block")
             if re.search(r"c2pa|contentcredential", blob, re.I):
                 has_c2pa = True
+    comments = _FindingSampler(findings, "comment", "provenance comments")
     for block in _provenance_comments(text):
         has_ai = True
-        findings.append(f"comment: {block[:120]}")
+        comments.add(block[:120])
         if re.search(r"c2pa|content.?credential", block, re.I):
             has_c2pa = True
+    comments.close()
     # data-ai* attributes. The optional separator group keeps the match to
     # the bare `data-ai` attribute or a `data-ai-*`/`data-ai_*` provenance name;
     # without it, `data-aid` / `data-airline` matched too (issue #395).
+    attrs = _FindingSampler(findings, "attr", "data-ai attributes")
     for m in re.finditer(r"\bdata-ai(?:[-_][\w-]*)?\s*=\s*[\"'][^\"']*[\"']", text, re.I):
         has_ai = True
-        findings.append(f"attr: {m.group(0)[:80]}")
+        attrs.add(m.group(0)[:80])
+    attrs.close()
 
     uri_c2pa, uri_ai, uri_findings = _inspect_embedded_data_uris(text)
     if uri_c2pa:

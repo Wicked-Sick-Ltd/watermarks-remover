@@ -13,6 +13,7 @@ import re
 import struct
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 import zlib
@@ -1451,20 +1452,42 @@ def strip_tiff(data: bytes, *, strip_all_metadata: bool = True) -> tuple[bytes, 
     return bytes(out), actions
 
 
+# c2pa-rs fetches the XMP dcterms:provenance URL of an asset with no embedded
+# manifest (remote_manifest_fetch defaults to true) and resolves did:web, OCSP
+# and timestamp URLs named inside a manifest, so the inspected file would choose
+# which hosts the probe contacts. An explicit empty allowed_network_hosts list
+# makes the SDK's HTTP resolver refuse every URL.
+C2PATOOL_OFFLINE_SETTINGS = """\
+[core]
+allowed_network_hosts = []
+
+[verify]
+remote_manifest_fetch = false
+ocsp_fetch = false
+"""
+
+
 def run_optional_tools(path: Path, *, include_exiftool: bool = True) -> dict[str, Any]:
     tools: dict[str, Any] = {}
     c2patool = which("c2patool")
     if c2patool:
         try:
-            r = subprocess.run(
-                [c2patool, safe_arg(str(path))],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                preexec_fn=subprocess_preexec_fn,
-                check=False,
-                creationflags=subprocess_creationflags,
-            )
+            # c2patool falls back to its network-enabled defaults when
+            # --settings names a missing file, and loads trust sidecars from
+            # that file's directory: write it into a fresh private directory
+            # and let any failure here abort the probe.
+            with tempfile.TemporaryDirectory(prefix="wm-c2patool-") as settings_dir:
+                settings = Path(settings_dir) / "c2pa.toml"
+                settings.write_text(C2PATOOL_OFFLINE_SETTINGS, encoding="utf-8")
+                r = subprocess.run(
+                    [c2patool, "--settings", str(settings), safe_arg(str(path))],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    preexec_fn=subprocess_preexec_fn,
+                    check=False,
+                    creationflags=subprocess_creationflags,
+                )
             out = (r.stdout or "") + (r.stderr or "")
             low = out.lower()
             # Negative markers must veto every positive branch, so the

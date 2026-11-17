@@ -12,6 +12,7 @@ import os
 import struct
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -374,6 +375,87 @@ def test_malformed_payload_reports_once_without_a_traceback(payload):
     assert result.returncode == EXIT_HOOK_ERROR
     assert "Traceback" not in result.stderr
     assert len(result.stderr.strip().splitlines()) == 1
+
+
+def _stream_write_payload(file_path: Path, body_bytes: int, stdin_cap: int):
+    """Feed the hook a Write payload whose ``content`` is *body_bytes* long.
+
+    Claude Code puts the written body in ``tool_input.content``, so a large
+    write is a large payload. The body goes through a real pipe in chunks, so
+    the hook can stop reading early and the writer sees how far it got.
+    Returns (exit code, bytes the hook let us write, stderr, peak RSS bytes).
+    """
+    env = os.environ.copy()
+    for var in ("WATERMARKS_HOOK_MODE", "CLAUDE_PLUGIN_OPTION_HOOK_MODE", "CLAUDE_PROJECT_DIR"):
+        env.pop(var, None)
+    env["WATERMARKS_HOOK_ROOT"] = str(file_path.parent)
+    env["WATERMARKS_MAX_STDIN_BYTES"] = str(stdin_cap)
+
+    head = '{"tool_name": "Write", "tool_input": {"file_path": ' + json.dumps(str(file_path))
+    head += ', "content": "'
+    tail = '"}, "tool_response": {"status": "success"}}'
+    chunk = b"x" * (1 << 16)
+
+    proc = subprocess.Popen(
+        [sys.executable, str(HOOK)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    written = 0
+
+    def feed() -> None:
+        nonlocal written
+        try:
+            proc.stdin.write(head.encode())
+            while written < body_bytes:
+                proc.stdin.write(chunk)
+                written += len(chunk)
+            proc.stdin.write(tail.encode())
+            proc.stdin.close()
+        except OSError:
+            pass
+
+    writer = threading.Thread(target=feed, daemon=True)
+    writer.start()
+    _, status, usage = os.wait4(proc.pid, 0)
+    proc.returncode = os.waitstatus_to_exitcode(status)
+    writer.join(timeout=10)
+    stderr = proc.stderr.read().decode("utf-8", errors="replace")
+    proc.stdout.close()
+    proc.stderr.close()
+    # ru_maxrss is KiB on Linux, bytes on macOS.
+    peak = usage.ru_maxrss if sys.platform == "darwin" else usage.ru_maxrss * 1024
+    return proc.returncode, written, stderr, peak
+
+
+@pytest.mark.skipif(not hasattr(os, "wait4"), reason="needs per-child rusage (POSIX)")
+def test_oversized_payload_is_refused_before_it_is_read_in_full(marked_file):
+    cap = 1 << 20
+    body = 128 << 20
+
+    _, _, _, baseline_peak = _stream_write_payload(marked_file, 1 << 10, cap)
+    code, written, stderr, peak = _stream_write_payload(marked_file, body, cap)
+
+    # The hook gives up once the cap is crossed instead of buffering the whole
+    # body: the writer is stopped long before the end, and the process never
+    # holds anything close to the payload in memory.
+    assert code == EXIT_HOOK_ERROR
+    assert "larger than" in stderr
+    assert "Traceback" not in stderr
+    assert written < cap + (8 << 20)
+    assert peak < baseline_peak + (32 << 20)
+    assert marked_file.read_bytes() == MARKED.read_bytes()
+
+
+@pytest.mark.skipif(not hasattr(os, "wait4"), reason="needs per-child rusage (POSIX)")
+def test_payload_with_a_body_under_the_cap_is_still_checked(marked_file):
+    code, written, stderr, _ = _stream_write_payload(marked_file, 1 << 18, 1 << 20)
+
+    assert written >= 1 << 18
+    assert code == EXIT_SHOW_MODEL
+    assert "U+200B" in stderr
 
 
 def test_oversized_file_is_skipped_rather_than_scanned(tmp_path, marked_file):

@@ -127,7 +127,11 @@ chose `file_path` — so the hook only touches files under one allowlisted root:
 `WATERMARKS_HOOK_ROOT` if set, else `CLAUDE_PROJECT_DIR` (Claude Code exports
 it to every hook), else the directory the hook runs from. A path that resolves
 outside that root, including through `..` or a symlink, is skipped with a note
-on stderr; the payload's own `cwd` is never used as the anchor.
+on stderr; the payload's own `cwd` is never used as the anchor. The payload
+is read in chunks under the same stdin cap as the command-line tools
+(`WATERMARKS_MAX_STDIN_BYTES`, default 64 MiB). Claude Code includes the
+written body in the payload, so an oversized one is refused with a
+non-blocking hook error before the rest is read or parsed.
 
 Without the plugin, wire it in `~/.claude/settings.json` (or a project
 `.claude/settings.json`) yourself:
@@ -520,6 +524,7 @@ set -a; . ./.env; set +a; python3 service/scripts/rewrite_text.py /tmp/x.txt -o 
 | `WATERMARKS_CLEAN_STRATEGY_FILE` | `server.py` `/clean` | Path to the Layer B strategy config JSON (default `config/clean_strategy.json`) |
 | `WATERMARKS_GUMBEL_KEY` | `detect_gumbel.py` / `text_detectors.py` | Secret key for keyed-Gumbel (EXP) same-key replay (e.g. `0x…`); preferred over argv — never logged |
 | `WATERMARKS_HOOK_ROOT` | `hook_written_file.py` | Only files under this directory are checked or cleaned; defaults to `CLAUDE_PROJECT_DIR`, then the hook's working directory |
+| `WATERMARKS_MAX_STDIN_BYTES` | CLI tools + `hook_written_file.py` | Largest stdin input (and hook payload) read before refusing; default 64 MiB |
 
 **Layer B is required for text cleaning.** `/clean` always applies the default
 strategy (from `config/clean_strategy.json`, `{"default_strategy": "paraphrase@0.8,mlm@0.2"}`) to a text file after Layer A, unless the request passes its own `"strategy"` option (an ordered `tactic@intensity` list). A strategy step is `tactic@intensity`; the `mlm` step needs `transformers` + `roberta-large`, and any LLM step (`paraphrase`, `humanize`, …) needs the `WATERMARKS_REWRITE_*` config. If the required backend/model isn't configured — or no strategy is available — `/clean` **rejects the request with a 400**. Precedence for the config path: `--strategy-config` CLI flag > `WATERMARKS_CLEAN_STRATEGY_FILE` env var > the default `config/clean_strategy.json`.

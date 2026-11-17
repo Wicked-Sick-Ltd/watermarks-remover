@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -192,42 +193,60 @@ def read_text_input(
     return data.decode("utf-8", errors="surrogateescape")
 
 
+STDIN_CHUNK_BYTES = 1 << 20
+
+
+class StdinTooLarge(ValueError):
+    """stdin carried more bytes than the caller allows."""
+
+
+def _iter_stdin_chunks() -> Iterator[bytes]:
+    """Yield stdin as raw bytes, never asking for more than one chunk at a time.
+
+    Read the raw byte stream rather than the decoded text, so callers that
+    sniff for binary see the real octets. Going through the text layer first
+    makes detection depend on the console codec: under cp1252 a PNG's leading
+    0x89 comes back as 0xe2 0x80 0xb0 and the magic number is gone before we
+    look. That the decode is UTF-8 today is only true while _configure_stdio()
+    succeeds, and its reconfigure() is deliberately best-effort.
+    """
+    stream = getattr(sys.stdin, "buffer", None)
+    if stream is not None:
+        while chunk := stream.read(STDIN_CHUNK_BYTES):
+            yield chunk
+        return
+    # A replaced or non-binary stdin (pytest capture, custom harness). Fall
+    # back to the text layer, still chunked; any sniff is then codec-dependent.
+    while text := sys.stdin.read(STDIN_CHUNK_BYTES):
+        yield text.encode("utf-8", errors="surrogateescape")
+
+
+def read_stdin_bytes(limit: int | None = None) -> bytes:
+    """Read all of stdin, raising :class:`StdinTooLarge` past *limit* bytes.
+
+    Stops at the first chunk that crosses the limit, so at most one chunk
+    beyond it is ever held. *limit* defaults to ``MAX_STDIN_BYTES``.
+    """
+    cap = MAX_STDIN_BYTES if limit is None else limit
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in _iter_stdin_chunks():
+        total += len(chunk)
+        if total > cap:
+            raise StdinTooLarge(f"stdin input larger than {cap} bytes")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _read_stdin_capped(
     *,
     allow_binary: bool = False,
     advice: tuple[str, ...] | None = None,
 ) -> str:
-    """Read stdin with a hard cap (uncapped stdin was a memory-DoS hole).
-
-    Read the raw byte stream rather than the decoded text, so the binary sniff
-    sees the real octets. Going through the text layer first makes detection
-    depend on the console codec: under cp1252 a PNG's leading 0x89 comes back
-    as 0xe2 0x80 0xb0 and the magic number is gone before we look. That the
-    decode is UTF-8 today is only true while _configure_stdio() succeeds, and
-    its reconfigure() is deliberately best-effort.
-    """
-    stream = getattr(sys.stdin, "buffer", None)
-    if stream is None:
-        # A replaced or non-binary stdin (pytest capture, custom harness).
-        # Fall back to the text layer; the sniff is then codec-dependent.
-        text = sys.stdin.read()
-        if len(text.encode("utf-8", errors="surrogateescape")) > MAX_STDIN_BYTES:
-            eprint(f"refusing stdin input larger than {MAX_STDIN_BYTES} bytes")
-            raise SystemExit(2)
-        guard_binary(
-            text[:BINARY_SNIFF_BYTES].encode("utf-8", errors="surrogateescape"),
-            "stdin",
-            allow_binary=allow_binary,
-            advice=advice,
-        )
-        return text
-
+    """Read stdin with a hard cap (uncapped stdin was a memory-DoS hole)."""
     chunks: list[bytes] = []
     total = 0
-    while True:
-        chunk = stream.read(1 << 20)
-        if not chunk:
-            break
+    for chunk in _iter_stdin_chunks():
         if not chunks:
             guard_binary(
                 chunk[:BINARY_SNIFF_BYTES],

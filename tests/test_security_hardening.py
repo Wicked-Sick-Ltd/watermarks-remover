@@ -245,6 +245,28 @@ def test_read_stdin_capped(tmp_path: Path, monkeypatch):
         read_text_input(None)
 
 
+class _EndlessTextStdin:
+    """A text-only stdin (no ``.buffer``) that never reaches EOF."""
+
+    def read(self, size: int = -1) -> str:
+        if size is None or size < 0:
+            raise AssertionError("stdin was read without a size bound")
+        return "x" * size
+
+
+def test_read_stdin_capped_on_text_only_stdin_reads_in_bounded_chunks(monkeypatch):
+    monkeypatch.setattr(common, "MAX_STDIN_BYTES", 16)
+    monkeypatch.setattr(sys, "stdin", _EndlessTextStdin())
+    with pytest.raises(SystemExit):
+        read_text_input(None)
+
+
+def test_read_stdin_bytes_refuses_endless_text_only_stdin(monkeypatch):
+    monkeypatch.setattr(sys, "stdin", _EndlessTextStdin())
+    with pytest.raises(common.StdinTooLarge):
+        common.read_stdin_bytes(16)
+
+
 def test_read_stdin_under_cap_ok(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(common, "MAX_STDIN_BYTES", 1024)
     monkeypatch.setattr(sys, "stdin", io.StringIO("hello stdin"))

@@ -201,7 +201,13 @@ def _c2patool_pin_check(tmp_path: Path, version_line: str) -> subprocess.Complet
     bindir = tmp_path / "bin"
     bindir.mkdir()
     tool = bindir / "c2patool"
-    tool.write_text(f"#!/bin/sh\nprintf '%s\\n' '{version_line}'\n", encoding="utf-8")
+    # newline="\n" keeps the shebang LF. The default on Windows is CRLF, and
+    # Git Bash then fails the fake tool with a bad interpreter.
+    tool.write_text(
+        f"#!/bin/sh\nprintf '%s\\n' '{version_line}'\n",
+        encoding="utf-8",
+        newline="\n",
+    )
     tool.chmod(0o755)
     env = os.environ.copy()
     env["PATH"] = f"{bindir}{os.pathsep}{env.get('PATH', '')}"

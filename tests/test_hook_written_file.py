@@ -414,7 +414,9 @@ def _stream_write_payload(file_path: Path, body_bytes: int, stdin_cap: int):
                 written += len(chunk)
             proc.stdin.write(tail.encode())
             proc.stdin.close()
-        except OSError:
+        except BrokenPipeError:
+            # The hook closes stdin once the payload exceeds the cap, so this
+            # write fails with a broken pipe. That is the writer stopping early.
             pass
 
     writer = threading.Thread(target=feed, daemon=True)

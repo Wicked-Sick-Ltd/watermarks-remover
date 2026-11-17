@@ -40,6 +40,10 @@
 !/SECURITY.md
 !/stealer/
 !/stealer/**
+!/.cursor/
+!/.cursor/install.sh
+!/.cursor/start.sh
+!/.cursor/environment.json
 
 # Exceptions even inside allowed trees
 .env

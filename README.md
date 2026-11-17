@@ -1232,6 +1232,19 @@ python3 -m venv .venv && .venv/bin/pip install pytest
 make smoke                          # quick CLI smoke on fixtures
 ```
 
+## Cloud agent environment
+
+Cursor Cloud Agents install with `.cursor/install.sh` (Python 3.10+ venv plus the pinned `requirements-dev.txt`, and the system tools the core cleaners shell out to: ffmpeg, qpdf, exiftool, Ghostscript, and the `c2patool` pin from `service/Dockerfile`). The script is idempotent and does not install the optional MarkLLM, CtrlRegen, or MarkDiffusion backends. No secret is required to install, test, or boot the core service.
+
+```bash
+bash .cursor/install.sh
+.venv/bin/python -m pytest -q
+.venv/bin/python -m ruff check service tests
+.venv/bin/python -m ruff format --check service tests
+```
+
+On boot, the `http` terminal runs `service/scripts/server.py` at `http://127.0.0.1:8765`. `GET /health` returns 200. `WATERMARKS_SERVER_API_KEY` is required only when `MARKLLM_DIR` is set. `HF_TOKEN` is required only to download gated Hugging Face models, which the cloud install does not do.
+
 ## Changelog
 
 ### [v0.7.0](https://github.com/guillaumemeyer/watermarks-remover/releases/tag/v0.7.0) — `/clean` Layer B rewrite, watermark-stealing module, audio/video watermark removal, and benchmark/tooling breadth

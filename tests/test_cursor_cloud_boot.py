@@ -195,3 +195,51 @@ def test_start_launches_service_and_sends_bearer_token(tmp_path: Path) -> None:
         assert token not in again.stdout
     finally:
         _stop(tmp_path, port)
+
+
+def _c2patool_pin_check(tmp_path: Path, version_line: str) -> subprocess.CompletedProcess[str]:
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    tool = bindir / "c2patool"
+    tool.write_text(f"#!/bin/sh\nprintf '%s\\n' '{version_line}'\n", encoding="utf-8")
+    tool.chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = f"{bindir}{os.pathsep}{env.get('PATH', '')}"
+    script = """
+source .cursor/install.sh
+if c2patool_matches_pin; then
+  printf '%s\\n' MATCH
+else
+  printf '%s\\n' MISMATCH
+  fail_c2patool_pin || true
+fi
+"""
+    return subprocess.run(
+        [BASH, "-c", script],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+
+
+@pytest.mark.skipif(BASH is None, reason="install script is bash")
+def test_c2patool_pin_accepts_the_configured_version(tmp_path: Path) -> None:
+    result = _c2patool_pin_check(tmp_path, "c2patool 0.27.15")
+    assert result.returncode == 0, result.stderr
+    assert "MATCH" in result.stdout
+    assert "error:" not in result.stderr
+
+
+@pytest.mark.skipif(BASH is None, reason="install script is bash")
+def test_c2patool_pin_rejects_a_different_version_on_path(tmp_path: Path) -> None:
+    """An older c2patool earlier on PATH must not count as the Dockerfile pin."""
+    result = _c2patool_pin_check(tmp_path, "c2patool 0.27.14")
+    assert result.returncode == 0, result.stderr
+    assert "MISMATCH" in result.stdout
+    assert "0.27.14" in result.stderr
+    assert "0.27.15" in result.stderr
+    assert "c2patool-v0.27.15" in result.stderr
+    assert str(tmp_path / "bin" / "c2patool") in result.stderr

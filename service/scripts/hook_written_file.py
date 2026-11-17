@@ -21,7 +21,9 @@ The payload is untrusted input: whatever produced the tool call also chose
 allowlisted root -- ``WATERMARKS_HOOK_ROOT``, else ``CLAUDE_PROJECT_DIR`` (set
 by Claude Code for every hook), else the hook's own working directory. A path
 that resolves outside that root, including through a symlink, is skipped.
-The payload's own ``cwd`` is never used as the anchor.
+The payload's own ``cwd`` is never used as the anchor. The payload itself is
+read in chunks under the same stdin cap as the command-line tools
+(``WATERMARKS_MAX_STDIN_BYTES``); a larger one is refused before it is parsed.
 
 Exit codes follow the PostToolUse contract: 0 = nothing to say, 2 = stderr is
 shown to the model. It never blocks a tool call, because PostToolUse fires
@@ -43,7 +45,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from audit_lib import is_actionable, scan_file
-from common import MAX_INPUT_BYTES, eprint, require_confined, subprocess_creationflags
+from common import (
+    MAX_INPUT_BYTES,
+    MAX_STDIN_BYTES,
+    StdinTooLarge,
+    eprint,
+    read_stdin_bytes,
+    require_confined,
+    subprocess_creationflags,
+)
 
 CLEAN_FILE_PY = Path(__file__).resolve().parent / "clean_file.py"
 
@@ -307,7 +317,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    raw = sys.stdin.read()
+    try:
+        data = read_stdin_bytes(MAX_STDIN_BYTES)
+    except StdinTooLarge:
+        # Claude Code puts the written body in the payload, so this is a huge
+        # write (or a forged payload). Stop reading rather than buffer it.
+        eprint(
+            f"watermarks-remover: hook payload is larger than {MAX_STDIN_BYTES} bytes; "
+            "skipped without reading the rest"
+        )
+        return EXIT_HOOK_ERROR
+    raw = data.decode("utf-8", errors="surrogateescape")
+    del data
     if not raw.strip():
         return EXIT_QUIET
     try:

@@ -3841,6 +3841,13 @@ def _pdf_iso_to_pdf_date(iso: str | None) -> str | None:
     return f"D:{y}{mo}{d}{h}{mi}{s}{sign}{oh}'{om}'"
 
 
+# ``listed`` when the attachment index did not finish. Distinct from 0, which
+# means qpdf listed the file and it has no embedded files. A near-zero
+# ``timeout()`` makes ``subprocess.run`` raise ``TimeoutExpired`` before qpdf
+# can answer; that must not look like an empty name tree.
+_ATTACHMENT_LIST_INCOMPLETE = -1
+
+
 def _pdf_attachment_list(
     path: Path, deadline: "_Deadline | None" = None, limit: int | None = None
 ) -> list[dict]:
@@ -3848,7 +3855,8 @@ def _pdf_attachment_list(
 
     Returns a list of ``{key, name, mimetype, description, creationdate,
     modificationdate}`` in PDF order, at most *limit* long. Empty when qpdf is
-    absent, the budget is spent, or the PDF carries no attachments.
+    absent, the listing did not finish, or the PDF carries no attachments.
+    Callers that have to tell those apart must use ``_pdf_attachment_index``.
     """
     return _pdf_attachment_index(path, deadline, limit)[0]
 
@@ -3856,12 +3864,18 @@ def _pdf_attachment_list(
 def _pdf_attachment_index(
     path: Path, deadline: "_Deadline | None", limit: int | None
 ) -> tuple[list[dict], int]:
-    """``(first *limit* attachments, how many the PDF lists in total)``."""
+    """``(first *limit* attachments, how many the PDF lists in total)``.
+
+    The count is ``_ATTACHMENT_LIST_INCOMPLETE`` when the budget was already
+    spent or qpdf timed out, including a not-yet-spent deadline whose
+    ``timeout()`` is too small for the process to finish. That is not an
+    empty listing.
+    """
     qpdf = which("qpdf")
     if not qpdf:
         return [], 0
     if deadline is not None and deadline.spent():
-        return [], 0
+        return [], _ATTACHMENT_LIST_INCOMPLETE
     try:
         r = subprocess.run(
             [qpdf, "--json", "--json-key=attachments", "--", safe_arg(str(path))],
@@ -3874,6 +3888,8 @@ def _pdf_attachment_index(
             preexec_fn=subprocess_preexec_fn,
             creationflags=subprocess_creationflags,
         )
+    except subprocess.TimeoutExpired:
+        return [], _ATTACHMENT_LIST_INCOMPLETE
     except Exception:
         return [], 0
     if r.returncode != 0:
@@ -4059,6 +4075,8 @@ def _pdf_inspect_attachments(
     if deadline.spent():
         return [], True
     attachments, listed = _pdf_attachment_index(path, deadline, deadline.attachments_left)
+    if listed < 0:
+        return [], True
     results: list[dict] = []
     truncated = listed > len(attachments)
     with tempfile.TemporaryDirectory(prefix="wr-att-insp-") as staging:
@@ -4138,6 +4156,9 @@ def _pdf_extract_attachments(
     embedded files — runs later.
     """
     attachments, listed = _pdf_attachment_index(path, deadline, deadline.attachments_left)
+    if listed < 0:
+        actions.append("warning: embedded-file list did not finish (clean budget)")
+        return [], [], True
     ok: list[dict] = []
     skipped: list[dict] = []
     if listed > len(attachments):
@@ -4217,7 +4238,17 @@ def _pdf_clean_attachments(
 
         # Did a re-distill drop the attachments from dest? If not, re-embedding
         # only the changed ones is enough; if so, every attachment is restored.
-        dest_has = bool(_pdf_attachment_list(dest, deadline, limit=1))
+        # A listing that did not finish is not "dest has none": that reading
+        # re-adds files that are still embedded.
+        on_dest, dest_listed = _pdf_attachment_index(dest, deadline, limit=1)
+        if dest_listed < 0:
+            actions.append(
+                "warning: could not list attachments on output; left existing entries in place"
+            )
+            dest_has = True
+            truncated = True
+        else:
+            dest_has = bool(on_dest)
         for i, att in enumerate(attachments):
             if deadline.spent():
                 actions.append("attachment pass stopped: clean budget exhausted")

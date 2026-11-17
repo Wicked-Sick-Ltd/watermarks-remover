@@ -453,3 +453,85 @@ def test_nested_pdf_attachment_spends_the_parent_budget(tmp_path, monkeypatch):
 
 def test_deadline_timeout_is_zero_once_spent():
     assert container_meta._Deadline(0).timeout(60.0) == 0.0
+
+
+def _qpdf_present(monkeypatch) -> None:
+    monkeypatch.setattr(container_meta, "which", lambda _name: "qpdf")
+
+
+def test_tiny_timeout_is_not_an_empty_attachment_list(monkeypatch, tmp_path):
+    """A not-yet-spent deadline can hand qpdf a near-zero timeout.
+
+    Timing out must not look like a finished listing of zero files, or the
+    clean pass reports "no embedded attachments" with truncated false.
+    """
+    _qpdf_present(monkeypatch)
+    seen: dict[str, float] = {}
+
+    def run(_args, **kwargs):
+        seen["timeout"] = kwargs["timeout"]
+        raise subprocess.TimeoutExpired(cmd="qpdf", timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(container_meta._Deadline, "timeout", lambda _self, _cap: 1e-4)
+
+    pdf = tmp_path / "in.pdf"
+    pdf.write_bytes(b"%PDF-1.7\n")
+    deadline = container_meta._Deadline(30)
+    _attachments, listed = container_meta._pdf_attachment_index(pdf, deadline, None)
+    assert seen["timeout"] < 0.01
+    assert listed < 0
+
+    actions: list[str] = []
+    meta = container_meta._pdf_clean_attachments(
+        pdf, tmp_path / "out.pdf", actions, deadline, "always", depth=0
+    )
+    assert meta["truncated"] is True
+    assert not any("no embedded attachments" in action for action in actions)
+
+    inspected, truncated = container_meta._pdf_inspect_attachments(pdf, deadline, depth=0)
+    assert inspected == []
+    assert truncated is True
+
+
+def test_failed_dest_listing_does_not_readd_files_still_there(monkeypatch, tmp_path):
+    """When the output listing times out, dest still having files is not "no"."""
+    _qpdf_present(monkeypatch)
+    src = tmp_path / "in.pdf"
+    dest = tmp_path / "out.pdf"
+    src.write_bytes(b"%PDF-1.7\n")
+    dest.write_bytes(b"%PDF-1.7\n")
+    payload = (
+        '{"attachments":{"note":{"preferredname":"note.txt","names":{},'
+        '"streams":{"1":{"mimetype":"text/plain"}}}}}'
+    )
+    calls = {"n": 0}
+
+    def run(_args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return subprocess.CompletedProcess(_args, 0, stdout=payload, stderr="")
+        raise subprocess.TimeoutExpired(cmd="qpdf", timeout=kwargs.get("timeout", 0))
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    def take(_path, _key, tmp, _deadline):
+        tmp.write_bytes(b"hello")
+        return 4, None
+
+    added: list[bool] = []
+
+    def add(*_args, remove_existing, **_kwargs):
+        added.append(remove_existing)
+        return True
+
+    monkeypatch.setattr(container_meta, "_pdf_take_attachment", take)
+    monkeypatch.setattr(container_meta, "_add_attachment", add)
+
+    actions: list[str] = []
+    meta = container_meta._pdf_clean_attachments(
+        src, dest, actions, container_meta._Deadline(30), "never", depth=0
+    )
+    assert meta["truncated"] is True
+    assert added == []
+    assert any("could not list attachments on output" in action for action in actions)

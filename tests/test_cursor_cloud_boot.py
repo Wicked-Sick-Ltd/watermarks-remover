@@ -72,6 +72,15 @@ def _stop(tmp_path: Path, port: int) -> None:
         time.sleep(0.1)
 
 
+def test_install_script_includes_exiftool_office_zip_support() -> None:
+    """exiftool needs Archive::Zip; the core image installs it explicitly."""
+    script = (ROOT / ".cursor" / "install.sh").read_text(encoding="utf-8")
+    dockerfile = (ROOT / "service" / "Dockerfile").read_text(encoding="utf-8")
+    assert "libarchive-zip-perl" in dockerfile
+    assert "libarchive-zip-perl" in script
+    assert "Archive::Zip" in script
+
+
 @pytest.mark.skipif(GIT is None, reason="git is required")
 def test_cursor_gitignore_tracks_only_environment_files() -> None:
     """Un-ignoring .cursor/ must not make local editor files committable."""

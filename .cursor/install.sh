@@ -20,6 +20,11 @@ for tool in curl ffmpeg ffprobe qpdf exiftool gs; do
     apt_missing=1
   fi
 done
+# exiftool only Recommends Archive::Zip. --no-install-recommends leaves it
+# out, and without it exiftool cannot read docx/xlsx/pptx packages.
+if ! perl -MArchive::Zip -e 1 >/dev/null 2>&1; then
+  apt_missing=1
+fi
 
 if [[ "$apt_missing" -eq 1 ]]; then
   if ! command -v sudo >/dev/null 2>&1; then
@@ -32,6 +37,7 @@ if [[ "$apt_missing" -eq 1 ]]; then
     curl \
     ffmpeg \
     ghostscript \
+    libarchive-zip-perl \
     libimage-exiftool-perl \
     python3 \
     python3-pip \

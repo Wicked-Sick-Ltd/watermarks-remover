@@ -1234,7 +1234,7 @@ make smoke                          # quick CLI smoke on fixtures
 
 ## Cloud agent environment
 
-Cursor Cloud Agents install with `.cursor/install.sh` (Python 3.10+ venv plus the pinned `requirements-dev.txt`, and the system tools the core cleaners shell out to: ffmpeg, qpdf, exiftool, Ghostscript, and the `c2patool` pin from `service/Dockerfile`). The script is idempotent and does not install the optional MarkLLM, CtrlRegen, or MarkDiffusion backends. No secret is required to install, test, or boot the core service.
+Cursor Cloud Agents install with `.cursor/install.sh` (Python 3.10+ venv plus the pinned `requirements-dev.txt`, and the system tools the core cleaners shell out to: ffmpeg, qpdf, exiftool with `libarchive-zip-perl` for Office packages, Ghostscript, and the `c2patool` pin from `service/Dockerfile`). The script is idempotent and does not install the optional MarkLLM, CtrlRegen, or MarkDiffusion backends. No secret is required to install, test, or boot the core service.
 
 ```bash
 bash .cursor/install.sh

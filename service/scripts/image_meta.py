@@ -16,6 +16,7 @@ import sys
 import urllib.error
 import urllib.request
 import zlib
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -254,6 +255,54 @@ def _contains_any(blob: bytes, needles: tuple[bytes, ...]) -> list[str]:
     return found
 
 
+# A file can repeat a tiny chunk until it reaches the input cap, so a walker
+# that records one finding or action per chunk keeps only this many.
+MAX_CHUNK_NOTES = 64
+
+
+class _ChunkNotes:
+    """Findings or actions recorded while walking a chunked container.
+
+    `append` is for notes that can repeat once per chunk: past
+    MAX_CHUNK_NOTES they are only counted. `append_once` is for notes a walk
+    emits at most once (a truncation before `break`), which are always kept.
+    """
+
+    def __init__(self, notes: Iterable[str] = ()) -> None:
+        self._notes: list[str] = list(notes)
+        self._per_chunk = 0
+        self._omitted = 0
+        self._omitted_at = 0
+
+    def append(self, note: str) -> None:
+        if self._per_chunk < MAX_CHUNK_NOTES:
+            self._per_chunk += 1
+            self._notes.append(note)
+            return
+        if not self._omitted:
+            self._omitted_at = len(self._notes)
+        self._omitted += 1
+
+    def extend(self, notes: Iterable[str]) -> None:
+        for note in notes:
+            self.append(note)
+
+    def append_once(self, note: str) -> None:
+        self._notes.append(note)
+
+    def __bool__(self) -> bool:
+        return bool(self._notes) or bool(self._omitted)
+
+    def to_list(self) -> list[str]:
+        notes = list(self._notes)
+        if self._omitted:
+            notes.insert(
+                self._omitted_at,
+                f"{self._omitted} more per-chunk notes omitted (limit {MAX_CHUNK_NOTES})",
+            )
+        return notes
+
+
 def _zlib_decompress_bounded(data: bytes) -> bytes:
     """Inflate zlib data, refusing output larger than the PNG-text budget.
 
@@ -374,7 +423,7 @@ def _text_chunk_is_ai(payload: bytes, ctype: bytes) -> bool:
 
 
 def inspect_png(data: bytes) -> tuple[bool, bool, list[str]]:
-    findings: list[str] = []
+    findings = _ChunkNotes()
     has_c2pa = False
     has_ai = False
     if not data.startswith(PNG_SIG):
@@ -386,7 +435,7 @@ def inspect_png(data: bytes) -> tuple[bool, bool, list[str]]:
         chunk_start = pos + 8
         chunk_end = chunk_start + length
         if chunk_end + 4 > len(data):
-            findings.append(f"truncated chunk {ctype!r}")
+            findings.append_once(f"truncated chunk {ctype!r}")
             break
         payload = data[chunk_start:chunk_end]
         name = ctype.decode("latin-1", errors="replace")
@@ -421,12 +470,12 @@ def inspect_png(data: bytes) -> tuple[bool, bool, list[str]]:
     whole = _contains_any(data, C2PA_MARKERS)
     if whole and not has_c2pa:
         has_c2pa = True
-        findings.append(f"byte-scan C2PA markers: {', '.join(whole[:6])}")
-    return has_c2pa, has_ai or has_c2pa, findings
+        findings.append_once(f"byte-scan C2PA markers: {', '.join(whole[:6])}")
+    return has_c2pa, has_ai or has_c2pa, findings.to_list()
 
 
 def inspect_jpeg(data: bytes) -> tuple[bool, bool, list[str]]:
-    findings: list[str] = []
+    findings = _ChunkNotes()
     has_c2pa = False
     has_ai = False
     if not data.startswith(JPEG_SOI):
@@ -454,7 +503,7 @@ def inspect_jpeg(data: bytes) -> tuple[bool, bool, list[str]]:
             break
         seglen = struct.unpack(">H", data[i : i + 2])[0]
         if seglen < 2 or i + seglen > n:
-            findings.append(f"bad segment length at marker 0x{marker:02X}")
+            findings.append_once(f"bad segment length at marker 0x{marker:02X}")
             break
         payload = data[i + 2 : i + seglen]
         i += seglen
@@ -485,54 +534,55 @@ def inspect_jpeg(data: bytes) -> tuple[bool, bool, list[str]]:
     whole = _contains_any(data, JPEG_C2PA_MARKERS)
     if whole and not has_c2pa:
         has_c2pa = True
-        findings.append(f"byte-scan C2PA markers: {', '.join(whole[:6])}")
-    return has_c2pa, has_ai or has_c2pa, findings
+        findings.append_once(f"byte-scan C2PA markers: {', '.join(whole[:6])}")
+    return has_c2pa, has_ai or has_c2pa, findings.to_list()
 
 
-def _webp_chunks(data: bytes) -> tuple[list[tuple[bytes, bytes, bytes]], list[str]]:
-    if detect_format(data) != "webp":
-        return [], ["not a WebP"]
+def _iter_webp_chunks(data: bytes, notes: list[str]) -> Iterator[tuple[bytes, int, int]]:
+    """Yield (fourcc, payload_start, payload_end) for each RIFF chunk of a WebP.
 
-    notes: list[str] = []
+    Chunks are walked in place and nothing is kept between them: a RIFF of
+    millions of empty chunks fits under the input cap. Structural problems
+    are appended to *notes*: a size mismatch before the first chunk, a
+    truncated chunk or trailing bytes when the walk ends.
+    """
+    n = len(data)
     declared_size = struct.unpack("<I", data[4:8])[0]
-    if declared_size + 8 != len(data):
-        notes.append(f"RIFF size mismatch: header={declared_size + 8} actual={len(data)}")
+    if declared_size + 8 != n:
+        notes.append(f"RIFF size mismatch: header={declared_size + 8} actual={n}")
 
-    chunks: list[tuple[bytes, bytes, bytes]] = []
     pos = 12
-    while pos + 8 <= len(data):
-        fourcc = data[pos : pos + 4]
-        length = struct.unpack("<I", data[pos + 4 : pos + 8])[0]
+    while pos + 8 <= n:
+        length = struct.unpack_from("<I", data, pos + 4)[0]
         payload_start = pos + 8
         payload_end = payload_start + length
         padded_end = payload_end + (length & 1)
-        if padded_end > len(data):
-            name = fourcc.decode("latin-1", errors="replace")
+        if padded_end > n:
+            name = data[pos : pos + 4].decode("latin-1", errors="replace")
             notes.append(f"truncated WebP chunk {name}")
-            break
-        chunks.append((fourcc, data[payload_start:payload_end], data[payload_end:padded_end]))
+            return
+        yield data[pos : pos + 4], payload_start, payload_end
         pos = padded_end
-    if pos != len(data) and not any("truncated" in note for note in notes):
-        notes.append(f"trailing WebP bytes: {len(data) - pos}")
-    return chunks, notes
+    if pos != n:
+        notes.append(f"trailing WebP bytes: {n - pos}")
 
 
 def inspect_webp(data: bytes) -> tuple[bool, bool, list[str]]:
-    chunks, findings = _webp_chunks(data)
-    if not chunks and findings == ["not a WebP"]:
-        return False, False, findings
+    if detect_format(data) != "webp":
+        return False, False, ["not a WebP"]
 
+    structure: list[str] = []
+    findings = _ChunkNotes()
     has_c2pa = False
     has_ai = False
-    for fourcc, payload, _padding in chunks:
-        name = fourcc.decode("latin-1", errors="replace")
+    for fourcc, start, end in _iter_webp_chunks(data, structure):
         if fourcc.upper() == b"C2PA":
             has_c2pa = True
             has_ai = True
             findings.append("WebP C2PA chunk")
             continue
         if fourcc in (b"XMP ", b"EXIF"):
-            hits = _contains_any(payload, AI_META_HINTS + C2PA_MARKERS)
+            hits = _contains_any(data[start:end], AI_META_HINTS + C2PA_MARKERS)
             if hits:
                 has_ai = True
                 if any(
@@ -540,8 +590,9 @@ def inspect_webp(data: bytes) -> tuple[bool, bool, list[str]]:
                     for hit in hits
                 ):
                     has_c2pa = True
+                name = fourcc.decode("latin-1", errors="replace")
                 findings.append(f"WebP {name}: {', '.join(hits[:8])}")
-    return has_c2pa, has_ai or has_c2pa, findings
+    return has_c2pa, has_ai or has_c2pa, structure + findings.to_list()
 
 
 XMP_UUID = b"\xbe\x7a\xcf\xcb\x97\xa9\x42\xe8\x9c\x71\x99\x94\x91\xe3\xaf\xac"
@@ -552,39 +603,43 @@ XMP_UUID = b"\xbe\x7a\xcf\xcb\x97\xa9\x42\xe8\x9c\x71\x99\x94\x91\xe3\xaf\xac"
 C2PA_BMFF_UUID = b"\xd8\xfe\xc3\xd6\x1b\x0e\x48\x3c\x92\x97\x58\x28\x87\x7e\xc4\x81"
 
 
-def _parse_isobmff_boxes(
+def _iter_isobmff_boxes(
     data: bytes, start: int = 0, end: int | None = None
-) -> tuple[list[tuple[bytes, bytes, int, int]], int]:
-    """Parse top-level or container ISOBMFF boxes.
+) -> Iterator[tuple[int, bytes, int, int]]:
+    """Walk top-level or container ISOBMFF boxes in data[start:end] in place.
 
-    Returns (boxes, scanned_end): the list of (fourcc, payload,
-    total_box_size, header_size) tuples and the offset where the walk
-    stopped -- the start of the first box that could not be parsed (an
-    overrunning box, or a run of fewer than 8 trailing bytes), or `end`
-    when the whole buffer parsed.
+    Yields (offset, fourcc, total_box_size, header_size); a box's payload is
+    data[offset + header_size : offset + total_box_size]. Nothing is kept
+    between boxes, so a run of millions of empty boxes costs one at a time.
+    The walk stops at the first box that cannot be parsed (an overrunning
+    box, or a run of fewer than 8 trailing bytes).
     """
     if end is None:
         end = len(data)
-    boxes = []
     pos = start
     while pos + 8 <= end:
-        size = struct.unpack(">I", data[pos : pos + 4])[0]
-        fourcc = data[pos + 4 : pos + 8]
+        size = struct.unpack_from(">I", data, pos)[0]
         header_size = 8
         if size == 1:
             if pos + 16 > end:
-                break
-            size = struct.unpack(">Q", data[pos + 8 : pos + 16])[0]
+                return
+            size = struct.unpack_from(">Q", data, pos + 8)[0]
             header_size = 16
         elif size == 0:
             size = end - pos
 
         if size < header_size or pos + size > end:
-            break
-        payload = data[pos + header_size : pos + size]
-        boxes.append((fourcc, payload, size, header_size))
+            return
+        yield pos, data[pos + 4 : pos + 8], size, header_size
         pos += size
-    return boxes, pos
+
+
+def _isobmff_scan_end(data: bytes, start: int = 0, end: int | None = None) -> int:
+    """Offset where _iter_isobmff_boxes stops: `start` when no box parses."""
+    scanned_end = start
+    for pos, _fourcc, size, _header_size in _iter_isobmff_boxes(data, start, end):
+        scanned_end = pos + size
+    return scanned_end
 
 
 def _build_isobmff_box(fourcc: bytes, payload: bytes, header_size: int = 8) -> bytes:
@@ -631,12 +686,12 @@ def _contains_c2pa_prov_box(data: bytes) -> bool:
 
 
 def inspect_isobmff(data: bytes, fmt: str = "avif") -> tuple[bool, bool, list[str]]:
-    findings: list[str] = []
+    findings = _ChunkNotes()
     has_c2pa = False
     has_ai = False
 
-    boxes, scanned_end = _parse_isobmff_boxes(data)
-    if not boxes:
+    scanned_end = _isobmff_scan_end(data)
+    if scanned_end == 0:
         # Box parsing failed (e.g. the first box's size overruns a truncated
         # download) — that is exactly when the whole-file byte scan below is
         # most useful, and every sibling inspector (png/jpeg/gif/tiff) still
@@ -644,17 +699,18 @@ def inspect_isobmff(data: bytes, fmt: str = "avif") -> tuple[bool, bool, list[st
         # report the parse failure alongside whatever it found (#167).
         whole = _contains_any(data, C2PA_MARKERS)
         if whole:
-            findings.append(f"byte-scan C2PA markers: {', '.join(whole[:6])}")
+            findings.append_once(f"byte-scan C2PA markers: {', '.join(whole[:6])}")
             has_c2pa = True
-        findings.append(f"not a valid {fmt.upper()} (no ISOBMFF boxes found)")
-        return has_c2pa, has_ai or has_c2pa, findings
+        findings.append_once(f"not a valid {fmt.upper()} (no ISOBMFF boxes found)")
+        return has_c2pa, has_ai or has_c2pa, findings.to_list()
 
-    for fourcc, payload, _, _ in boxes:
+    for pos, fourcc, size, header_size in _iter_isobmff_boxes(data):
         name = fourcc.decode("latin-1", errors="replace")
         if fourcc in (b"jumb", b"c2pa") or name.lower().startswith("c2"):
             has_c2pa = True
             findings.append(f"{fmt.upper()} top-level box {name} (C2PA/JUMBF manifest)")
         elif fourcc == b"uuid":
+            payload = data[pos + header_size : pos + size]
             if payload.startswith(XMP_UUID):
                 has_ai = True
                 xmp_text = payload[16:]
@@ -681,8 +737,9 @@ def inspect_isobmff(data: bytes, fmt: str = "avif") -> tuple[bool, bool, list[st
                     if any(h.lower() in ("c2pa", "contentcredentials", "jumb") for h in hits):
                         has_c2pa = True
         elif fourcc == b"meta":
-            meta_sub, _ = _parse_isobmff_boxes(payload, start=4)
-            for s_fourcc, s_payload, _, _ in meta_sub:
+            meta_sub = _iter_isobmff_boxes(data, pos + header_size + 4, pos + size)
+            for s_pos, s_fourcc, s_size, s_hdr in meta_sub:
+                s_payload = data[s_pos + s_hdr : s_pos + s_size]
                 s_name = s_fourcc.decode("latin-1", errors="replace")
                 if s_fourcc in (b"jumb", b"c2pa") or s_name.lower().startswith("c2"):
                     has_c2pa = True
@@ -719,22 +776,22 @@ def inspect_isobmff(data: bytes, fmt: str = "avif") -> tuple[bool, bool, list[st
     # compressed stream can coincidentally contain these short ASCII markers.
     # Keep the whole-file scan as a recovery path only when box walking stopped
     # early, which covers truncated containers such as #167/#176. A gap of 1-7
-    # bytes is not an early stop: _parse_isobmff_boxes walks `while pos + 8 <=
+    # bytes is not an early stop: _iter_isobmff_boxes walks `while pos + 8 <=
     # end`, so a fully parsed container with trailing padding leaves that much
     # behind. Only >= 8 bytes can hold a box header, i.e. a real truncation
     # (the same threshold strip_isobmff and av_meta already use, #170).
     whole = _contains_any(data, C2PA_MARKERS)
     if whole and not has_c2pa and len(data) - scanned_end >= 8:
         has_c2pa = True
-        findings.append(f"byte-scan C2PA markers: {', '.join(whole[:6])}")
+        findings.append_once(f"byte-scan C2PA markers: {', '.join(whole[:6])}")
     elif len(data) - scanned_end >= 8 and _contains_c2pa_prov_box(data) and not has_c2pa:
         # A C2PA content-provenance uuid box whose manifest bytes carry no
         # ASCII 'c2pa'/'jumb' marker (e.g. an auxiliary "merkle" box, or a
         # truncated manifest) is still a manifest box; catch it by user type.
         has_c2pa = True
-        findings.append("byte-scan C2PA BMFF content-provenance user type")
+        findings.append_once("byte-scan C2PA BMFF content-provenance user type")
 
-    return has_c2pa, has_ai or has_c2pa, findings
+    return has_c2pa, has_ai or has_c2pa, findings.to_list()
 
 
 # ---------------------------------------------------------------------------
@@ -899,7 +956,7 @@ _GIF_CONTROL_APPLICATION_IDS = (b"NETSCAPE2.0", b"ICCRGBG1012")
 
 def inspect_gif(data: bytes) -> tuple[bool, bool, list[str]]:
     """Inspect GIF comment / application extensions and XMP payloads."""
-    findings: list[str] = []
+    findings = _ChunkNotes()
     has_c2pa = False
     has_ai = False
     if data[:6] not in GIF_SIGS:
@@ -919,7 +976,7 @@ def inspect_gif(data: bytes) -> tuple[bool, bool, list[str]]:
         if block == 0x21:
             info = _gif_extension_info(data, pos, n)
             if info is None:
-                findings.append("truncated GIF extension")
+                findings.append_once("truncated GIF extension")
                 break
             end, label, payload = info
             if label == 0xFE:
@@ -942,7 +999,7 @@ def inspect_gif(data: bytes) -> tuple[bool, bool, list[str]]:
         elif block == 0x2C:
             end = _gif_image_end(data, pos, n)
             if end is None:
-                findings.append("truncated GIF image block")
+                findings.append_once("truncated GIF image block")
                 break
             pos = end
         else:
@@ -950,10 +1007,10 @@ def inspect_gif(data: bytes) -> tuple[bool, bool, list[str]]:
     whole = _contains_any(data, C2PA_MARKERS)
     if whole and not has_c2pa:
         has_c2pa = True
-        findings.append(f"byte-scan C2PA markers: {', '.join(whole[:6])}")
+        findings.append_once(f"byte-scan C2PA markers: {', '.join(whole[:6])}")
     if not findings:
-        findings.append("no GIF metadata extensions found")
-    return has_c2pa, has_ai or has_c2pa, findings
+        findings.append_once("no GIF metadata extensions found")
+    return has_c2pa, has_ai or has_c2pa, findings.to_list()
 
 
 def strip_gif(data: bytes, *, strip_all_metadata: bool = True) -> tuple[bytes, list[str]]:
@@ -968,7 +1025,7 @@ def strip_gif(data: bytes, *, strip_all_metadata: bool = True) -> tuple[bytes, l
     """
     if data[:6] not in GIF_SIGS:
         raise ValueError("not GIF")
-    actions: list[str] = []
+    actions = _ChunkNotes()
     out = bytearray(data[:6])
     n = len(data)
     pos = 6
@@ -1029,8 +1086,8 @@ def strip_gif(data: bytes, *, strip_all_metadata: bool = True) -> tuple[bytes, l
             pos += 1
 
     if not actions:
-        actions.append("no GIF metadata blocks removed (already clean or none matched)")
-    return bytes(out), actions
+        actions.append_once("no GIF metadata blocks removed (already clean or none matched)")
+    return bytes(out), actions.to_list()
 
 
 # ---------------------------------------------------------------------------
@@ -1940,7 +1997,7 @@ def _png_chunk(ctype: bytes, payload: bytes) -> bytes:
 def strip_png(data: bytes, *, strip_all_text: bool = True) -> tuple[bytes, list[str]]:
     if not data.startswith(PNG_SIG):
         raise ValueError("not PNG")
-    actions: list[str] = []
+    actions = _ChunkNotes()
     out = bytearray(PNG_SIG)
     pos = 8
     while pos + 8 <= len(data):
@@ -1955,7 +2012,7 @@ def strip_png(data: bytes, *, strip_all_text: bool = True) -> tuple[bytes, list[
             # (#170). Note it as an action so the run is never mistaken for
             # an ordinary no-op clean.
             out.extend(data[pos:])
-            actions.append(
+            actions.append_once(
                 f"kept {len(data) - pos} bytes of truncated chunk {ctype.decode('latin-1', errors='replace')} tail (file truncated)"
             )
             break
@@ -1997,14 +2054,14 @@ def strip_png(data: bytes, *, strip_all_text: bool = True) -> tuple[bytes, list[
         if ctype == b"IEND":
             break
     if not actions:
-        actions.append("no PNG metadata chunks removed (already clean or none matched)")
-    return bytes(out), actions
+        actions.append_once("no PNG metadata chunks removed (already clean or none matched)")
+    return bytes(out), actions.to_list()
 
 
 def strip_jpeg(data: bytes, *, strip_all_app: bool = True) -> tuple[bytes, list[str]]:
     if not data.startswith(JPEG_SOI):
         raise ValueError("not JPEG")
-    actions: list[str] = []
+    actions = _ChunkNotes()
     out = bytearray(JPEG_SOI)
     i = 2
     n = len(data)
@@ -2012,7 +2069,7 @@ def strip_jpeg(data: bytes, *, strip_all_app: bool = True) -> tuple[bytes, list[
         if data[i] != 0xFF:
             # unexpected; copy rest
             out.extend(data[i:])
-            actions.append("copied remainder after non-marker byte")
+            actions.append_once("copied remainder after non-marker byte")
             break
         while i < n and data[i] == 0xFF:
             i += 1
@@ -2039,7 +2096,7 @@ def strip_jpeg(data: bytes, *, strip_all_app: bool = True) -> tuple[bytes, list[
             # Reconstruct: FF DA + rest of file
             out.extend(b"\xff\xda")
             out.extend(data[i:])
-            actions.append("preserved entropy-coded scan (SOS→EOF)")
+            actions.append_once("preserved entropy-coded scan (SOS→EOF)")
             break
 
         if i + 2 > n:
@@ -2047,7 +2104,7 @@ def strip_jpeg(data: bytes, *, strip_all_app: bool = True) -> tuple[bytes, list[
         seglen = struct.unpack(">H", data[i : i + 2])[0]
         if seglen < 2 or i + seglen > n:
             out.extend(data[i - 2 :])  # best effort
-            actions.append("truncated segment; copied remainder")
+            actions.append_once("truncated segment; copied remainder")
             break
         payload = data[i + 2 : i + seglen]
         next_i = i + seglen
@@ -2084,53 +2141,62 @@ def strip_jpeg(data: bytes, *, strip_all_app: bool = True) -> tuple[bytes, list[
         i = next_i
 
     if not actions:
-        actions.append("no JPEG APP segments removed")
-    return bytes(out), actions
+        actions.append_once("no JPEG APP segments removed")
+    return bytes(out), actions.to_list()
+
+
+_WEBP_METADATA_FLAGS = {b"ICCP": 0x20, b"EXIF": 0x08, b"XMP ": 0x04}
+
+
+def _webp_chunk_dropped(
+    data: bytes, fourcc: bytes, start: int, end: int, strip_all_metadata: bool
+) -> bool:
+    if fourcc in _WEBP_METADATA_FLAGS:
+        return strip_all_metadata or bool(
+            _contains_any(data[start:end], AI_META_HINTS + C2PA_MARKERS)
+        )
+    return fourcc.upper() == b"C2PA"
 
 
 def strip_webp(data: bytes, *, strip_all_metadata: bool = True) -> tuple[bytes, list[str]]:
-    chunks, notes = _webp_chunks(data)
-    if not chunks and notes == ["not a WebP"]:
+    if detect_format(data) != "webp":
         raise ValueError("not WebP")
+
+    # First pass: validate the RIFF and learn which VP8X feature flags the
+    # dropped chunks clear, without keeping any chunk.
+    notes: list[str] = []
+    dropped = False
+    removed_flags = 0
+    for fourcc, start, end in _iter_webp_chunks(data, notes):
+        if _webp_chunk_dropped(data, fourcc, start, end, strip_all_metadata):
+            dropped = True
+            removed_flags |= _WEBP_METADATA_FLAGS.get(fourcc, 0)
     if notes:
         raise ValueError("malformed WebP: " + "; ".join(notes))
+    if not dropped:
+        return bytes(data), ["no WebP metadata chunks removed (already clean or none matched)"]
 
-    actions: list[str] = []
-    kept: list[tuple[bytes, bytes, bytes]] = []
-    removed_flags = 0
-    metadata_flags = {b"ICCP": 0x20, b"EXIF": 0x08, b"XMP ": 0x04}
-
-    for fourcc, payload, padding in chunks:
-        drop = fourcc.upper() == b"C2PA"
-        if fourcc in metadata_flags:
-            drop = strip_all_metadata or bool(_contains_any(payload, AI_META_HINTS + C2PA_MARKERS))
-        if drop:
+    actions = _ChunkNotes()
+    view = memoryview(data)
+    out = bytearray(WEBP_RIFF + b"\x00\x00\x00\x00" + WEBP_SIG)
+    for fourcc, start, end in _iter_webp_chunks(data, []):
+        if _webp_chunk_dropped(data, fourcc, start, end, strip_all_metadata):
             name = fourcc.decode("latin-1", errors="replace")
             actions.append(f"drop WebP chunk {name}")
-            removed_flags |= metadata_flags.get(fourcc, 0)
-        else:
-            kept.append((fourcc, payload, padding))
-
-    body = bytearray(WEBP_SIG)
-    for fourcc, payload, padding in kept:
-        chunk = payload
-        if fourcc == b"VP8X" and len(chunk) >= 1 and removed_flags:
-            chunk = bytes([chunk[0] & ~removed_flags]) + chunk[1:]
-        body.extend(fourcc)
-        body.extend(struct.pack("<I", len(chunk)))
-        body.extend(chunk)
-        body.extend(padding if len(chunk) & 1 else b"")
-
-    if not actions:
-        actions.append("no WebP metadata chunks removed (already clean or none matched)")
-    return WEBP_RIFF + struct.pack("<I", len(body)) + bytes(body), actions
+            continue
+        chunk_at = len(out)
+        out += view[start - 8 : end + ((end - start) & 1)]
+        if fourcc == b"VP8X" and end > start and removed_flags:
+            out[chunk_at + 8] &= ~removed_flags & 0xFF
+    struct.pack_into("<I", out, 4, len(out) - 8)
+    return bytes(out), actions.to_list()
 
 
 def strip_isobmff(
     data: bytes, fmt: str = "avif", *, strip_all_metadata: bool = True
 ) -> tuple[bytes, list[str]]:
-    boxes, scanned_end = _parse_isobmff_boxes(data)
-    if not boxes:
+    scanned_end = _isobmff_scan_end(data)
+    if scanned_end == 0:
         raise ValueError(f"not a valid {fmt.upper()} (no ISOBMFF boxes)")
 
     # scanned_end is where the box walk stopped: the parser halts at the first
@@ -2138,10 +2204,11 @@ def strip_isobmff(
     # rebuild below used to emit only the boxes that parsed — dropping a
     # truncated mdat, the actual coded image, while reporting "already clean"
     # (#170); the tail is appended verbatim afterwards instead.
-    actions: list[str] = []
+    actions = _ChunkNotes()
     out = bytearray()
 
-    for fourcc, payload, size, header_size in boxes:
+    for pos, fourcc, size, header_size in _iter_isobmff_boxes(data):
+        payload = data[pos + header_size : pos + size]
         name = fourcc.decode("latin-1", errors="replace")
         if fourcc in (b"jumb", b"c2pa") or name.lower().startswith("c2"):
             actions.append(f"drop top-level {name} box (C2PA/JUMBF)")
@@ -2164,9 +2231,10 @@ def strip_isobmff(
 
         if fourcc == b"meta":
             meta_verflags = payload[:4] if len(payload) >= 4 else b"\x00\x00\x00\x00"
-            sub_boxes, _ = _parse_isobmff_boxes(payload, start=4)
+            sub_boxes = _iter_isobmff_boxes(data, pos + header_size + 4, pos + size)
             clean_sub = bytearray()
-            for s_fourcc, s_payload, s_size, s_hdr in sub_boxes:
+            for s_pos, s_fourcc, s_size, s_hdr in sub_boxes:
+                s_payload = data[s_pos + s_hdr : s_pos + s_size]
                 s_name = s_fourcc.decode("latin-1", errors="replace")
                 if s_fourcc in (b"jumb", b"c2pa") or s_name.lower().startswith("c2"):
                     actions.append(f"drop meta sub-box {s_name} (C2PA/JUMBF)")
@@ -2208,12 +2276,14 @@ def strip_isobmff(
         # worth reporting; fewer than 8 leftover bytes is merely trailing junk
         # and is kept verbatim without claiming the file was truncated (#170).
         if len(tail) >= 8:
-            actions.append(f"kept {len(tail)} bytes of truncated tail (file truncated)")
+            actions.append_once(f"kept {len(tail)} bytes of truncated tail (file truncated)")
 
     if not actions:
-        actions.append(f"no {fmt.upper()} metadata boxes removed (already clean or none matched)")
+        actions.append_once(
+            f"no {fmt.upper()} metadata boxes removed (already clean or none matched)"
+        )
 
-    return bytes(out), actions
+    return bytes(out), actions.to_list()
 
 
 def clean_image(

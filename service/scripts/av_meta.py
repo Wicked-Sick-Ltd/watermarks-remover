@@ -25,6 +25,7 @@ Known scope limits (documented, not silently mishandled):
 from __future__ import annotations
 
 import struct
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -34,9 +35,11 @@ from image_meta import (
     AI_META_HINTS,
     XMP_UUID,  # noqa: F401 -- re-exported for callers that want the raw constant
     _build_isobmff_box,
+    _ChunkNotes,
     _contains_any,
     _isobmff_free_box,
-    _parse_isobmff_boxes,
+    _isobmff_scan_end,
+    _iter_isobmff_boxes,
     inspect_isobmff,
     strip_isobmff,
 )
@@ -101,32 +104,33 @@ def _classify_c2pa(hits: list[str]) -> bool:
 def _inspect_moov_udta(data: bytes) -> tuple[bool, bool, list[str]]:
     has_c2pa = False
     has_ai = False
-    findings: list[str] = []
-    for fourcc, payload, _size, _hdr in _parse_isobmff_boxes(data)[0]:
+    findings = _ChunkNotes()
+    for pos, fourcc, size, hdr in _iter_isobmff_boxes(data):
         if fourcc != b"moov":
             continue
-        for s_fourcc, s_payload, _s_size, _s_hdr in _parse_isobmff_boxes(payload)[0]:
+        for s_pos, s_fourcc, s_size, s_hdr in _iter_isobmff_boxes(data, pos + hdr, pos + size):
             if s_fourcc != b"udta":
                 continue
-            hits = _contains_any(s_payload, AI_META_HINTS)
+            hits = _contains_any(data[s_pos + s_hdr : s_pos + s_size], AI_META_HINTS)
             if hits:
                 has_ai = True
                 if _classify_c2pa(hits):
                     has_c2pa = True
                 findings.append(f"MP4 moov/udta box: {', '.join(hits[:8])}")
-    return has_c2pa, has_ai, findings
+    return has_c2pa, has_ai, findings.to_list()
 
 
 def _strip_moov_udta(data: bytes, *, strip_all_metadata: bool) -> tuple[bytes, list[str], bool]:
-    actions: list[str] = []
+    actions = _ChunkNotes()
     out = bytearray()
-    boxes, scanned_end = _parse_isobmff_boxes(data)
-    for fourcc, payload, _size, hdr in boxes:
+    scanned_end = _isobmff_scan_end(data)
+    for pos, fourcc, size, hdr in _iter_isobmff_boxes(data):
         if fourcc != b"moov":
-            out.extend(_build_isobmff_box(fourcc, payload, hdr))
+            out.extend(_build_isobmff_box(fourcc, data[pos + hdr : pos + size], hdr))
             continue
         new_moov = bytearray()
-        for s_fourcc, s_payload, s_size, s_hdr in _parse_isobmff_boxes(payload)[0]:
+        for s_pos, s_fourcc, s_size, s_hdr in _iter_isobmff_boxes(data, pos + hdr, pos + size):
+            s_payload = data[s_pos + s_hdr : s_pos + s_size]
             if s_fourcc == b"udta" and (
                 strip_all_metadata or _contains_any(s_payload, AI_META_HINTS)
             ):
@@ -136,7 +140,7 @@ def _strip_moov_udta(data: bytes, *, strip_all_metadata: bool) -> tuple[bytes, l
             new_moov.extend(_build_isobmff_box(s_fourcc, s_payload, s_hdr))
         out.extend(_build_isobmff_box(b"moov", bytes(new_moov), hdr))
     out.extend(data[scanned_end:])
-    return bytes(out), actions, len(data) - scanned_end >= 8
+    return bytes(out), actions.to_list(), len(data) - scanned_end >= 8
 
 
 def _inspect_mp4(data: bytes) -> tuple[bool, bool, list[str]]:
@@ -183,13 +187,39 @@ def _id3v2_frames_start(data: bytes, total: int, major: int) -> int | None:
     return pos if pos <= total else None
 
 
-def _parse_id3v2_frames(data: bytes) -> tuple[int, int, list[tuple[bytes, bytes]]] | None:
-    """Parse an ID3v2 tag at the start of *data*.
+def _iter_id3v2_frames(
+    data: bytes, major: int, pos: int, frames_end: int
+) -> Iterator[tuple[bytes, int, int]]:
+    """Walk v2.3/v2.4 frames from *pos* in place.
 
-    Returns (tag_total_size, major_version, frames); frames is a list of
-    (frame_id, frame_payload) for v2.3/v2.4 tags (4-byte frame IDs). v2.2
-    tags (3-byte frame IDs) are detected but returned with an empty frame
-    list -- callers fall back to whole-tag byte-scanning and whole-tag drop.
+    Yields (frame_id, payload_start, payload_end); nothing is kept between
+    frames. Stops at padding, at fewer than 10 bytes left, or at a frame
+    that overruns *frames_end*.
+    """
+    while pos + 10 <= frames_end:
+        frame_id = data[pos : pos + 4]
+        if frame_id == b"\x00\x00\x00\x00":
+            return  # padding
+        frame_size = (
+            _id3v2_size(data, pos + 4) if major == 4 else struct.unpack_from(">I", data, pos + 4)[0]
+        )
+        frame_start = pos + 10
+        frame_end = frame_start + frame_size
+        if frame_end > frames_end:
+            return
+        yield frame_id, frame_start, frame_end
+        pos = frame_end
+
+
+def _parse_id3v2_frames(data: bytes) -> tuple[int, int, int, int] | None:
+    """Validate an ID3v2 tag at the start of *data*.
+
+    Returns (tag_total_size, major_version, frames_start, frames_stop): the
+    v2.3/v2.4 frames (4-byte frame IDs) are the ones _iter_id3v2_frames
+    yields from frames_start to frames_stop, and there are none when the two
+    are equal. v2.2 tags (3-byte frame IDs) are detected but returned with
+    no frames -- callers fall back to whole-tag byte-scanning and whole-tag
+    drop.
     """
     if len(data) < 10 or data[:3] != b"ID3":
         return None
@@ -203,30 +233,19 @@ def _parse_id3v2_frames(data: bytes) -> tuple[int, int, list[tuple[bytes, bytes]
     if footer_size and data[frames_end:total] != b"3DI" + data[3:10]:
         return None
     if major < 3:
-        return total, major, []
+        return total, major, 10, 10
 
-    frames: list[tuple[bytes, bytes]] = []
-    pos = _id3v2_frames_start(data, frames_end, major)
-    if pos is None:
+    frames_start = _id3v2_frames_start(data, frames_end, major)
+    if frames_start is None:
         return None
-    while pos + 10 <= frames_end:
-        frame_id = data[pos : pos + 4]
-        if frame_id == b"\x00\x00\x00\x00":
-            break  # padding
-        frame_size = (
-            _id3v2_size(data, pos + 4)
-            if major == 4
-            else struct.unpack(">I", data[pos + 4 : pos + 8])[0]
-        )
-        frame_start = pos + 10
-        frame_end = frame_start + frame_size
-        if frame_size < 0 or frame_end > frames_end:
-            return None
-        frames.append((frame_id, data[frame_start:frame_end]))
+    pos = frames_start
+    for _frame_id, _start, frame_end in _iter_id3v2_frames(data, major, pos, frames_end):
         pos = frame_end
+    if pos + 10 <= frames_end and data[pos : pos + 4] != b"\x00\x00\x00\x00":
+        return None  # a frame overruns the tag
     if any(data[pos:frames_end]):
         return None
-    return total, major, frames
+    return total, major, frames_start, pos
 
 
 def _inspect_id3v2(data: bytes) -> tuple[bool, bool, list[str]]:
@@ -248,28 +267,28 @@ def _inspect_id3v2(data: bytes) -> tuple[bool, bool, list[str]]:
     parsed = _parse_id3v2_frames(data)
     if parsed is None:
         return False, False, []
-    total, major, frames = parsed
-    findings: list[str] = []
+    total, major, frames_start, frames_stop = parsed
+    findings = _ChunkNotes()
     has_ai = False
     has_c2pa = False
 
-    if not frames:
+    if frames_start == frames_stop:
         hits = _contains_any(data[:total], AI_META_HINTS)
         if hits:
             has_ai = True
             has_c2pa = _classify_c2pa(hits)
             findings.append(f"ID3v2.{major} tag: {', '.join(hits[:8])}")
-        return has_c2pa, has_ai, findings
+        return has_c2pa, has_ai, findings.to_list()
 
-    for frame_id, payload in frames:
-        hits = _contains_any(payload, AI_META_HINTS)
+    for frame_id, start, end in _iter_id3v2_frames(data, major, frames_start, frames_stop):
+        hits = _contains_any(data[start:end], AI_META_HINTS)
         if hits:
             has_ai = True
             if _classify_c2pa(hits):
                 has_c2pa = True
             label = frame_id.decode("latin-1", errors="replace")
             findings.append(f"ID3v2 frame {label}: {', '.join(hits[:8])}")
-    return has_c2pa, has_ai, findings
+    return has_c2pa, has_ai, findings.to_list()
 
 
 def _is_valid_mp3_frame_header(data: bytes, offset: int) -> bool:
@@ -316,10 +335,10 @@ def _strip_id3v2(data: bytes, *, strip_all_metadata: bool) -> tuple[bytes, list[
     parsed = _parse_id3v2_frames(data)
     if parsed is None:
         return data, []
-    total, major, frames = parsed
+    total, major, frames_start, frames_stop = parsed
     rest = data[total:]
 
-    if not frames:
+    if frames_start == frames_stop:
         # v2.2 (undecomposed) or an empty v2.3/2.4 tag: only a whole-tag drop
         # is safe here, since frame boundaries were never decoded.
         if not strip_all_metadata and not _contains_any(data[:total], AI_META_HINTS):
@@ -330,8 +349,9 @@ def _strip_id3v2(data: bytes, *, strip_all_metadata: bool) -> tuple[bytes, list[
         return rest, [f"drop ID3v2.{major} tag ({total} bytes)"]
 
     kept = bytearray()
-    actions: list[str] = []
-    for frame_id, payload in frames:
+    actions = _ChunkNotes()
+    for frame_id, start, end in _iter_id3v2_frames(data, major, frames_start, frames_stop):
+        payload = data[start:end]
         hits = _contains_any(payload, AI_META_HINTS)
         if hits:
             label = frame_id.decode("latin-1", errors="replace")
@@ -346,7 +366,7 @@ def _strip_id3v2(data: bytes, *, strip_all_metadata: bool) -> tuple[bytes, list[
         return data, ["no ID3v2 frames removed (already clean or none matched)"]
 
     header = bytes([ord("I"), ord("D"), ord("3"), major, 0, 0]) + _id3v2_size_bytes(len(kept))
-    return header + bytes(kept) + rest, actions
+    return header + bytes(kept) + rest, actions.to_list()
 
 
 # ---------------------------------------------------------------------------
@@ -380,8 +400,11 @@ def _inspect_flac(data: bytes) -> tuple[bool, bool, list[str]]:
     parsed = _parse_id3v2_frames(data)
     if parsed is None:
         return False, False, []
-    _total, _major, frames = parsed
-    if any(_is_c2pa_geob(frame_id, payload) for frame_id, payload in frames):
+    _total, major, frames_start, frames_stop = parsed
+    if any(
+        _is_c2pa_geob(frame_id, data[start:end])
+        for frame_id, start, end in _iter_id3v2_frames(data, major, frames_start, frames_stop)
+    ):
         return True, True, ["C2PA-related manifest in ID3v2 frame GEOB: application/c2pa"]
     return False, False, []
 
@@ -390,32 +413,29 @@ def _strip_flac(data: bytes, *, strip_all_metadata: bool) -> tuple[bytes, list[s
     parsed = _parse_id3v2_frames(data)
     if parsed is None:
         return data, ["no FLAC ID3v2 metadata removed (already clean or none matched)"]
-    total, major, frames = parsed
+    total, major, frames_start, frames_stop = parsed
     rest = data[total:]
     if strip_all_metadata:
         return rest, [f"drop FLAC ID3v2.{major} tag ({total} bytes)"]
 
     kept = bytearray()
-    actions: list[str] = []
-    pos = _id3v2_frames_start(data, total, major)
-    if pos is None:
+    actions = _ChunkNotes()
+    if _id3v2_frames_start(data, total, major) is None:
         return data, ["no FLAC C2PA metadata removed (invalid ID3v2 extended header)"]
-    for frame_id, payload in frames:
-        frame_end = pos + 10 + len(payload)
-        if _is_c2pa_geob(frame_id, payload):
+    for frame_id, start, end in _iter_id3v2_frames(data, major, frames_start, frames_stop):
+        if _is_c2pa_geob(frame_id, data[start:end]):
             actions.append("drop FLAC ID3v2 frame GEOB: application/c2pa")
         else:
-            kept.extend(data[pos:frame_end])
-        pos = frame_end
+            kept.extend(data[start - 10 : end])
 
     if not actions:
         return data, ["no FLAC C2PA metadata removed (already clean or none matched)"]
 
     if not kept:
-        return rest, actions
+        return rest, actions.to_list()
 
     header = data[:5] + bytes([data[5] & ~0x50]) + _id3v2_size_bytes(len(kept))
-    return header + bytes(kept) + rest, actions
+    return header + bytes(kept) + rest, actions.to_list()
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +444,7 @@ def _strip_flac(data: bytes, *, strip_all_metadata: bool) -> tuple[bytes, list[s
 
 
 def _inspect_wav(data: bytes) -> tuple[bool, bool, list[str]]:
-    findings: list[str] = []
+    findings = _ChunkNotes()
     has_ai = False
     has_c2pa = False
     pos = 12  # past "RIFF" + size(4) + "WAVE"
@@ -453,11 +473,11 @@ def _inspect_wav(data: bytes) -> tuple[bool, bool, list[str]]:
                 has_c2pa = has_c2pa or c2pa
                 findings.extend(f"WAV id3 chunk / {f}" for f in sub_findings)
         pos = cend + (csize & 1)  # chunks are word-aligned
-    return has_c2pa, has_ai, findings
+    return has_c2pa, has_ai, findings.to_list()
 
 
 def _strip_wav(data: bytes, *, strip_all_metadata: bool) -> tuple[bytes, list[str]]:
-    actions: list[str] = []
+    actions = _ChunkNotes()
     out = bytearray(data[:12])
     pos = 12
     while pos + 8 <= len(data):
@@ -490,8 +510,8 @@ def _strip_wav(data: bytes, *, strip_all_metadata: bool) -> tuple[bytes, list[st
 
     struct.pack_into("<I", out, 4, len(out) - 8)
     if not actions:
-        actions.append("no WAV metadata chunks removed (already clean or none matched)")
-    return bytes(out), actions
+        actions.append_once("no WAV metadata chunks removed (already clean or none matched)")
+    return bytes(out), actions.to_list()
 
 
 # ---------------------------------------------------------------------------

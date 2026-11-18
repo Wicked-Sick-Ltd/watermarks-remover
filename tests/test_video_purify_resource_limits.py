@@ -41,7 +41,6 @@ sys.path.insert(0, str(SCRIPTS))
 import clean_video
 import common
 import server
-from clean_video import video_purify
 
 FFMPEG = shutil.which("ffmpeg")
 FFPROBE = shutil.which("ffprobe")
@@ -257,7 +256,7 @@ def test_video_purify_caps_extracted_frames(tmp_path, frame_counter, remove_pixe
     assert _duration_seconds(src) < 5
     assert src.stat().st_size < 256 << 20
 
-    result = video_purify(
+    result = clean_video.video_purify(
         src,
         tmp_path / "out.mp4",
         remove_pixel=remove_pixel,
@@ -278,7 +277,7 @@ def test_default_timeout_is_one_budget_for_every_frame(tmp_path, monkeypatch, re
     offset = _install_clock(monkeypatch)
     calls = _install_purifier(monkeypatch, offset)
 
-    video_purify(
+    clean_video.video_purify(
         src,
         tmp_path / "out.mp4",
         remove_pixel=remove_pixel,
@@ -295,7 +294,7 @@ def test_explicit_timeout_is_one_budget_for_every_frame(tmp_path, monkeypatch):
     offset = _install_clock(monkeypatch)
     calls = _install_purifier(monkeypatch, offset)
 
-    video_purify(
+    clean_video.video_purify(
         src,
         tmp_path / "out.mp4",
         remove_pixel="ctrlregen",
@@ -312,7 +311,7 @@ def test_short_clip_under_the_cap_purifies_every_frame(tmp_path, monkeypatch, fr
     _high_frame_mp4(src, SHORT_CLIP_FRAMES, rate=20)
     calls = _install_purifier(monkeypatch, offset=None)
 
-    result = video_purify(
+    result = clean_video.video_purify(
         src,
         tmp_path / "out.mp4",
         remove_pixel="ctrlregen",
@@ -402,7 +401,7 @@ def test_clean_batch_caps_frames_for_diffusion(tmp_path, monkeypatch, frame_coun
     srv, thread = _serve()
     try:
         conn = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=120)
-        _status, _payload = _post(conn, "/clean/batch", body)
+        _post(conn, "/clean/batch", body)
         conn.close()
     finally:
         srv.shutdown()

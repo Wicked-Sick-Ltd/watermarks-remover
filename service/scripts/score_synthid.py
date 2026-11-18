@@ -53,7 +53,12 @@ def _png_dimensions(path: Path) -> tuple[int, int] | None:
 
 
 def _jpeg_dimensions(path: Path) -> tuple[int, int] | None:
-    """Width and height from the first JPEG SOF marker. Stops before entropy data."""
+    """Width and height from the first JPEG SOF marker. Stops before entropy data.
+
+    Only a byte after ``0xFF`` is a marker. A stray non-FF byte is skipped, and
+    ``FF 00`` is a stuffed byte. Treating either as a length-prefixed segment
+    walks off the real SOF and the later decode still allocates the bitmap.
+    """
     with path.open("rb") as handle:
         if handle.read(2) != b"\xff\xd8":
             return None
@@ -61,11 +66,17 @@ def _jpeg_dimensions(path: Path) -> tuple[int, int] | None:
             byte = handle.read(1)
             if not byte:
                 return None
-            while byte == b"\xff":
-                byte = handle.read(1)
-                if not byte:
+            if byte != b"\xff":
+                continue
+            while True:
+                nxt = handle.read(1)
+                if not nxt:
                     return None
-            marker = byte[0]
+                if nxt != b"\xff":
+                    break
+            marker = nxt[0]
+            if marker == 0x00:
+                continue
             if marker in (0xD9, 0xDA):
                 return None
             if marker == 0x01 or 0xD0 <= marker <= 0xD8:

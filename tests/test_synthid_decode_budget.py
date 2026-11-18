@@ -545,6 +545,29 @@ def test_score_file_rejects_grayscale_png_before_allocating(
     _assert_budget_refusal(result, score_baseline["maxrss_kib"])
 
 
+@pytest.mark.parametrize("prefix", [b"\x00", b"\xff\x00"], ids=["stray-byte", "stuffed-ff00"])
+def test_score_file_rejects_jpeg_sof_after_padding(
+    prefix: bytes, tmp_path: Path, upstream: Path, score_baseline: dict
+) -> None:
+    """A stray byte or a stuffed FF 00 before the markers must not hide the SOF."""
+    image = tmp_path / "padded.jpg"
+    data = _jpeg_with_sof(OVER_SIDE)
+    assert data[:2] == b"\xff\xd8"
+    image.write_bytes(data[:2] + prefix + data[2:])
+    result = _run_score(image, upstream)
+    _assert_budget_refusal(result, score_baseline["maxrss_kib"])
+
+
+def test_small_jpeg_with_stuffed_byte_is_not_refused_for_size(
+    tmp_path: Path, upstream: Path
+) -> None:
+    image = tmp_path / "small.jpg"
+    assert _TINY_JPEG[:2] == b"\xff\xd8"
+    image.write_bytes(_TINY_JPEG[:2] + b"\xff\x00" + _TINY_JPEG[2:])
+    result = _run_score(image, upstream)
+    assert not _mentions_budget(result.get("stderr"), result.get("payload"))
+
+
 def test_score_file_rejects_jpeg_sof_before_allocating(
     tmp_path: Path, upstream: Path, score_baseline: dict
 ) -> None:

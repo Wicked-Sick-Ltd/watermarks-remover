@@ -15,11 +15,11 @@ Apply a final text-hygiene pass to prose the user owns or is authorized to proce
    - commands, paths, URLs, identifiers, API names, and exact values
    - formulas, citations, and text the user asks to quote verbatim
 3. Preserve every claim, fact, number, name, citation, and requirement. Never invent a detail, name, number, quote, or source to make the prose easier to write or more varied: if a fact is missing, flag the gap rather than fill it. The rewrite may sharpen, compress, or reorder, but it may not add or remove claims.
-4. **Measure before.** Inspect and score the input with the vendored zero-LLM stylometry estimator (see Scoring) and record the score. Read the report's `density_tier`: rewrite only when it is `high`; for `low` or `medium`, verify the text and otherwise leave the text unchanged. For a flag-only audit that never rewrites, use `--audit`:
+4. **Measure before.** Inspect and score the input with the vendored zero-LLM stylometry estimator (see Scoring) and record the score. Read the report's `density_tier`: rewrite only when it is `high`; for `low` or `medium`, verify the text and otherwise leave the text unchanged. For a flag-only audit that never rewrites, use `--audit`. Bind `SCRIPTS`, `INPUT`, `OUTPUT`, and `FINAL` first, as described in Passing file paths safely, then run the commands as written:
 
    ```bash
-   PYTHON "$SCRIPTS/inspect_text.py" --stylometry --json INPUT
-   PYTHON "$SCRIPTS/inspect_text.py" --audit INPUT  # detect-only: lists flagged spans, no rewrite
+   PYTHON "$SCRIPTS/inspect_text.py" --stylometry --json "$INPUT"
+   PYTHON "$SCRIPTS/inspect_text.py" --audit "$INPUT"  # detect-only: lists flagged spans, no rewrite
    ```
 
 5. Establish the writing brief before changing prose:
@@ -31,7 +31,7 @@ Apply a final text-hygiene pass to prose the user owns or is authorized to proce
 6. **Layer A — strip artifacts first.** For text artifacts or supplied text files, run the deterministic Unicode pass before rewriting, so the rewrite operates on clean, marker-free text:
 
    ```bash
-   PYTHON "$SCRIPTS/clean_text.py" INPUT -o OUTPUT --stats --no-normalize-spaces
+   PYTHON "$SCRIPTS/clean_text.py" "$INPUT" -o "$OUTPUT" --stats --no-normalize-spaces
    ```
 
 7. **Layer B — rewrite once.** Rewrite the remaining prose once, applying the detector levers (see Detector levers) in order:
@@ -45,7 +45,7 @@ Apply a final text-hygiene pass to prose the user owns or is authorized to proce
 8. **Layer A again.** Run the deterministic Unicode pass on the rewritten result to catch any artifacts the rewrite introduced (smart quotes, em dashes, homoglyphs):
 
    ```bash
-   PYTHON "$SCRIPTS/clean_text.py" OUTPUT -o FINAL --stats --no-normalize-spaces
+   PYTHON "$SCRIPTS/clean_text.py" "$OUTPUT" -o "$FINAL" --stats --no-normalize-spaces
    ```
 
 9. **Measure after.** Score the rewritten text the same way. Report scores and confidence levels when available; otherwise report `status: insufficient_length`. A lower after-score means the measurable signals moved; it is not a verdict from any detector, and it never overrides the fact and voice rules above.
@@ -84,6 +84,24 @@ Use the available Python 3 launcher for the platform. Replace `PYTHON` below
 with `python3` on most macOS/Linux systems, `py` on Windows, or another verified
 Python 3 command.
 
+### Passing file paths safely
+
+The commands refer to files only through the shell variables `"$SCRIPTS"`, `"$INPUT"`, `"$OUTPUT"`, and `"$FINAL"`, always inside double quotes. Never paste a path into a command in their place, with or without quotes: a file name can contain `;`, `|`, `&`, `>`, `$(...)`, backticks, or spaces, and the shell would run or split them.
+
+Bind each path once as a single-quoted assignment, then run the commands exactly as written:
+
+```bash
+SCRIPTS='/home/me/.cursor/skills/clean-user-facing-text/scripts'
+INPUT='drafts/q3 report.md'
+OUTPUT='drafts/q3 report.cleaned.md'
+FINAL='drafts/q3 report.final.md'
+```
+
+- Refuse a path that contains a quotation mark of any kind (`'`, `"`, or a typographic quote from U+2018 to U+201F), a newline, a tab, or any other control character. Do not try to escape it: tell the user the name cannot be passed to the shell safely and ask them to rename the file or copy it to a plain name.
+- If a path starts with `-`, prefix it with `./` so the script does not read it as an option.
+- When the host can start a program from an argument list instead of a shell string, prefer that, and pass each path as its own argument.
+- In PowerShell, apply the same rules with PowerShell variables, for example `$InputPath = 'drafts\q3 report.md'` and `py "$Scripts\clean_text.py" $InputPath -o $OutputPath`. Do not run these commands through `cmd.exe`.
+
 This skill is self-contained and runs its vendored scripts directly; it has no
 service or network dependency. Deterministic Layer A cleaning below is invoked
 by script, intentionally, so the skill works where the HTTP service is absent.
@@ -92,12 +110,12 @@ Inspect first when editing an existing file (include `--stylometry` to record
 the before score):
 
 ```bash
-PYTHON "$SCRIPTS/inspect_text.py" --stylometry --json INPUT
-PYTHON "$SCRIPTS/clean_text.py" INPUT -o OUTPUT --stats --no-normalize-spaces
-PYTHON "$SCRIPTS/inspect_text.py" --stylometry --json OUTPUT
+PYTHON "$SCRIPTS/inspect_text.py" --stylometry --json "$INPUT"
+PYTHON "$SCRIPTS/clean_text.py" "$INPUT" -o "$OUTPUT" --stats --no-normalize-spaces
+PYTHON "$SCRIPTS/inspect_text.py" --stylometry --json "$OUTPUT"
 ```
 
-Use `-` for stdin. Prefer a new `*.cleaned.*` output unless the user explicitly requests in-place editing.
+Use `INPUT='-'` for stdin. Prefer a new `*.cleaned.*` output unless the user explicitly requests in-place editing.
 
 Use `--no-normalize-spaces` by default so NBSP, narrow no-break spaces, figure spaces, and CJK ideographic spaces retain their layout semantics. Normalize spaces only when the user requests it.
 

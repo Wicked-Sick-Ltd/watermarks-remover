@@ -216,7 +216,8 @@ def _peak_rss_kib() -> int:
             raise RuntimeError(f"unexpected VmHWM unit: {line!r}")
         raise RuntimeError("VmHWM missing from /proc/self/status")
     if sys.platform == "win32":
-        import ctypes
+        # `import ctypes` does not load the wintypes submodule.
+        import ctypes.wintypes
 
         class _Counters(ctypes.Structure):
             _fields_ = [
@@ -332,13 +333,38 @@ def baseline_fallback_unbounded() -> int:
 
 
 def _start_sidecar(upstream: Path) -> subprocess.Popen[str]:
-    return subprocess.Popen(
-        [sys.executable, str(THIS_FILE), "serve", str(upstream)],
+    """Start the sidecar and drain stderr on another thread.
+
+    A full stderr pipe blocks the child before it can print its port. Windows
+    and macOS fill that pipe sooner than Linux, so the reader has to start
+    before the first stdout line is expected.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-u", str(THIS_FILE), "serve", str(upstream)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
         text=True,
         env=_child_env(upstream),
     )
+    captured: dict[str, str] = {"err": ""}
+
+    def _drain() -> None:
+        assert proc.stderr is not None
+        captured["err"] = proc.stderr.read()
+
+    drainer = threading.Thread(target=_drain, daemon=True)
+    drainer.start()
+    proc._stderr_captured = captured  # type: ignore[attr-defined]
+    proc._stderr_drainer = drainer  # type: ignore[attr-defined]
+    return proc
+
+
+def _captured_stderr(proc: subprocess.Popen[str]) -> str:
+    captured = getattr(proc, "_stderr_captured", None)
+    if isinstance(captured, dict):
+        return str(captured.get("err") or "")
+    return ""
 
 
 def _read_stdout_line(proc: subprocess.Popen[str], timeout: float) -> str:
@@ -354,7 +380,9 @@ def _read_stdout_line(proc: subprocess.Popen[str], timeout: float) -> str:
     reader.start()
     reader.join(timeout)
     if reader.is_alive():
-        raise AssertionError(f"sidecar produced no stdout (returncode={proc.poll()})")
+        err = _captured_stderr(proc).strip()
+        detail = f" stderr={err[:500]!r}" if err else ""
+        raise AssertionError(f"sidecar produced no stdout (returncode={proc.poll()}){detail}")
     return box.get("line", "")
 
 
@@ -418,15 +446,22 @@ def _post_sidecar(proc: subprocess.Popen[str], port: int, data: bytes) -> dict:
 
 
 def _finish_sidecar(proc: subprocess.Popen[str]) -> str:
-    """Stderr captured after the process has exited."""
+    """Stderr captured after the process has exited.
+
+    The drain thread started with the process is the only stderr reader.
+    ``communicate`` would race it.
+    """
     if proc.poll() is None:
         proc.terminate()
     try:
-        _out, err = proc.communicate(timeout=5)
+        proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         proc.kill()
-        _out, err = proc.communicate(timeout=5)
-    return err or ""
+        proc.wait(timeout=5)
+    drainer = getattr(proc, "_stderr_drainer", None)
+    if isinstance(drainer, threading.Thread):
+        drainer.join(timeout=5)
+    return _captured_stderr(proc)
 
 
 def _core_request(route: str, data: bytes, name: str) -> dict:

@@ -351,32 +351,35 @@ def _windows_peak_rss_kib() -> int:
 
 
 def _start_sidecar(upstream: Path) -> tuple[subprocess.Popen[str], Path]:
-    """Start the sidecar and drain stderr on another thread.
+    """Start the sidecar with files for the port, RSS, and stderr.
 
-    The port is written to a file. A stdout pipe on macOS can swallow the
-    announcement, and a full stderr pipe can block the child before it writes.
+    A stdout or stderr pipe can fill and block the child before it publishes
+    its port. macOS does that during startup. Files do not.
     """
     fd, name = tempfile.mkstemp(prefix="wm-sidecar-port-")
     os.close(fd)
     port_path = Path(name)
+    rss_path = port_path.with_name(port_path.name + ".rss")
+    err_path = port_path.with_name(port_path.name + ".err")
+    err_handle = err_path.open("w", encoding="utf-8")
     proc = subprocess.Popen(
-        [sys.executable, "-u", str(THIS_FILE), "serve", str(upstream), str(port_path)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        [
+            sys.executable,
+            "-u",
+            str(THIS_FILE),
+            "serve",
+            str(upstream),
+            str(port_path),
+            str(rss_path),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=err_handle,
         stdin=subprocess.DEVNULL,
-        text=True,
         env=_child_env(upstream),
     )
-    captured: dict[str, str] = {"err": ""}
-
-    def _drain() -> None:
-        assert proc.stderr is not None
-        captured["err"] = proc.stderr.read()
-
-    drainer = threading.Thread(target=_drain, daemon=True)
-    drainer.start()
-    proc._stderr_captured = captured  # type: ignore[attr-defined]
-    proc._stderr_drainer = drainer  # type: ignore[attr-defined]
+    err_handle.close()
+    proc._rss_path = rss_path  # type: ignore[attr-defined]
+    proc._err_path = err_path  # type: ignore[attr-defined]
     return proc, port_path
 
 
@@ -403,29 +406,30 @@ def _wait_port(proc: subprocess.Popen[str], port_path: Path, timeout: float) -> 
 
 
 def _captured_stderr(proc: subprocess.Popen[str]) -> str:
-    captured = getattr(proc, "_stderr_captured", None)
-    if isinstance(captured, dict):
-        return str(captured.get("err") or "")
+    err_path = getattr(proc, "_err_path", None)
+    if isinstance(err_path, Path) and err_path.is_file():
+        return err_path.read_text(encoding="utf-8", errors="replace")
     return ""
 
 
 def _read_stdout_line(proc: subprocess.Popen[str], timeout: float) -> str:
-    """Read one stdout line. ``select`` cannot wait on pipes on Windows."""
-    assert proc.stdout is not None
-    box: dict[str, str] = {}
-
-    def _read() -> None:
-        assert proc.stdout is not None
-        box["line"] = proc.stdout.readline()
-
-    reader = threading.Thread(target=_read, daemon=True)
-    reader.start()
-    reader.join(timeout)
-    if reader.is_alive():
-        err = _captured_stderr(proc).strip()
-        detail = f" stderr={err[:500]!r}" if err else ""
-        raise AssertionError(f"sidecar produced no stdout (returncode={proc.poll()}){detail}")
-    return box.get("line", "")
+    """Wait until the sidecar's RSS file has one ``RSS <kib>`` line."""
+    rss_path = getattr(proc, "_rss_path", None)
+    if not isinstance(rss_path, Path):
+        raise AssertionError("sidecar has no RSS file")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if rss_path.is_file():
+            text = rss_path.read_text(encoding="ascii", errors="replace").strip()
+            if text.startswith("RSS "):
+                return text + "\n"
+        if proc.poll() is not None:
+            break
+        time.sleep(0.05)
+    err = _captured_stderr(proc).strip()
+    raise AssertionError(
+        f"sidecar did not report RSS (returncode={proc.poll()}) stderr={err[:500]!r}"
+    )
 
 
 @contextlib.contextmanager
@@ -488,11 +492,7 @@ def _post_sidecar(proc: subprocess.Popen[str], port: int, data: bytes) -> dict:
 
 
 def _finish_sidecar(proc: subprocess.Popen[str]) -> str:
-    """Stderr captured after the process has exited.
-
-    The drain thread started with the process is the only stderr reader.
-    ``communicate`` would race it.
-    """
+    """Stderr captured after the process has exited."""
     if proc.poll() is None:
         proc.terminate()
     try:
@@ -500,10 +500,12 @@ def _finish_sidecar(proc: subprocess.Popen[str]) -> str:
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait(timeout=5)
-    drainer = getattr(proc, "_stderr_drainer", None)
-    if isinstance(drainer, threading.Thread):
-        drainer.join(timeout=5)
-    return _captured_stderr(proc)
+    text = _captured_stderr(proc)
+    for attr in ("_err_path", "_rss_path"):
+        path = getattr(proc, attr, None)
+        if isinstance(path, Path):
+            path.unlink(missing_ok=True)
+    return text
 
 
 def _core_request(route: str, data: bytes, name: str) -> dict:
@@ -808,6 +810,7 @@ def _worker_score(image: str, upstream: str, *, cli: bool) -> int:
 
 def _worker_serve(upstream: str) -> int:
     marker = Path(sys.argv[3]) if len(sys.argv) > 3 else None
+    rss_path = Path(sys.argv[4]) if len(sys.argv) > 4 else None
     if marker is not None:
         marker.write_text("starting\n", encoding="ascii")
     os.environ["REVERSE_SYNTHID_DIR"] = upstream
@@ -826,13 +829,12 @@ def _worker_serve(upstream: str) -> int:
                 sys.stderr.write(f"{exc}\n")
                 sys.stderr.flush()
                 rss = baseline_fallback_unbounded()
-            sys.stdout.write(f"RSS {rss}\n")
-            sys.stdout.flush()
+            if rss_path is not None:
+                rss_path.write_text(f"RSS {rss}\n", encoding="ascii")
 
     httpd = sidecar.ThreadingHTTPServer(("127.0.0.1", 0), _MeasuringHandler)
-    port = f"{httpd.server_address[1]}\n"
     if marker is not None:
-        marker.write_text(port, encoding="ascii")
+        marker.write_text(f"{httpd.server_address[1]}\n", encoding="ascii")
     httpd.serve_forever()
     return 0
 

@@ -434,9 +434,8 @@ def _make_symlink(dest: Path, target: Path) -> None:
 
 
 def test_clean_staged_symlinked_path_exits_partial_end_to_end(tmp_path, monkeypatch, capsys):
-    """End-to-end symlink write refusal leaves backup and exits EXIT_PARTIAL (3)."""
-    # No mocking: common.py refuses to write through a symlink, clean_file.py
-    # does not handle that OSError, and the hook used to swallow it as a skip.
+    """End-to-end symlink refusal leaves no backup and exits EXIT_PARTIAL (3)."""
+    # No mocking: the hook used to swallow a symlinked path as a skip.
     target = tmp_path / "real" / "target.txt"
     target.parent.mkdir()
     target.write_text(_watermarked_text(), encoding="utf-8")
@@ -449,11 +448,10 @@ def test_clean_staged_symlinked_path_exits_partial_end_to_end(tmp_path, monkeypa
     assert target.read_text(encoding="utf-8") == _watermarked_text()
     err = capsys.readouterr().err
     assert "could not be cleaned" in err
-    assert "refusing to write through symlink" in err
-    # clean_file.py backs up before it writes, so a failed run leaves a sidecar.
-    # The report names it rather than deleting a file this wrapper did not make.
-    assert (tmp_path / "link.txt.bak").exists()
-    assert "backup left behind" in err
+    assert "symlink" in err
+    # A backup beside the link would be a copy of whatever the link points at.
+    assert not (tmp_path / "link.txt.bak").exists()
+    assert "backup left behind" not in err
 
 
 def test_pre_commit_hooks_manifest_defines_both_hooks():

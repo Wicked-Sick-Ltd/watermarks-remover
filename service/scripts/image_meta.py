@@ -13,6 +13,7 @@ import re
 import struct
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 import zlib
@@ -22,8 +23,10 @@ from typing import Any
 from urllib.parse import urlparse
 
 from common import (
+    actions_list,
     c2patool_probe_note,
     classify_finding_confidence,
+    findings_list,
     safe_arg,
     safe_write_bytes,
     subprocess_creationflags,
@@ -374,7 +377,7 @@ def _text_chunk_is_ai(payload: bytes, ctype: bytes) -> bool:
 
 
 def inspect_png(data: bytes) -> tuple[bool, bool, list[str]]:
-    findings: list[str] = []
+    findings = findings_list()
     has_c2pa = False
     has_ai = False
     if not data.startswith(PNG_SIG):
@@ -426,7 +429,7 @@ def inspect_png(data: bytes) -> tuple[bool, bool, list[str]]:
 
 
 def inspect_jpeg(data: bytes) -> tuple[bool, bool, list[str]]:
-    findings: list[str] = []
+    findings = findings_list()
     has_c2pa = False
     has_ai = False
     if not data.startswith(JPEG_SOI):
@@ -493,7 +496,7 @@ def _webp_chunks(data: bytes) -> tuple[list[tuple[bytes, bytes, bytes]], list[st
     if detect_format(data) != "webp":
         return [], ["not a WebP"]
 
-    notes: list[str] = []
+    notes = findings_list()
     declared_size = struct.unpack("<I", data[4:8])[0]
     if declared_size + 8 != len(data):
         notes.append(f"RIFF size mismatch: header={declared_size + 8} actual={len(data)}")
@@ -631,7 +634,7 @@ def _contains_c2pa_prov_box(data: bytes) -> bool:
 
 
 def inspect_isobmff(data: bytes, fmt: str = "avif") -> tuple[bool, bool, list[str]]:
-    findings: list[str] = []
+    findings = findings_list()
     has_c2pa = False
     has_ai = False
 
@@ -792,7 +795,7 @@ def inspect_bmp(data: bytes) -> tuple[bool, bool, list[str]]:
     provenance data can live is after the image payload. Pixel bytes are never
     scanned, so compressed/embedded-image data cannot false-positive.
     """
-    findings: list[str] = []
+    findings = findings_list()
     if len(data) < 14 or data[:2] != BMP_SIG:
         return False, False, ["not a BMP"]
     trailing = _bmp_trailing(data)
@@ -899,7 +902,7 @@ _GIF_CONTROL_APPLICATION_IDS = (b"NETSCAPE2.0", b"ICCRGBG1012")
 
 def inspect_gif(data: bytes) -> tuple[bool, bool, list[str]]:
     """Inspect GIF comment / application extensions and XMP payloads."""
-    findings: list[str] = []
+    findings = findings_list()
     has_c2pa = False
     has_ai = False
     if data[:6] not in GIF_SIGS:
@@ -968,7 +971,7 @@ def strip_gif(data: bytes, *, strip_all_metadata: bool = True) -> tuple[bytes, l
     """
     if data[:6] not in GIF_SIGS:
         raise ValueError("not GIF")
-    actions: list[str] = []
+    actions = actions_list()
     out = bytearray(data[:6])
     n = len(data)
     pos = 6
@@ -1257,7 +1260,7 @@ def _tiff_entry_payload(data: bytes, ent: dict[str, Any]) -> bytes | None:
 
 def inspect_tiff(data: bytes) -> tuple[bool, bool, list[str]]:
     """Walk the IFD chains (classic or BigTIFF) and report metadata tags."""
-    findings: list[str] = []
+    findings = findings_list()
     has_c2pa = False
     has_ai = False
     try:
@@ -1336,7 +1339,7 @@ def strip_tiff(data: bytes, *, strip_all_metadata: bool = True) -> tuple[bytes, 
     off_len = 8 if bigtiff else 4
     off_fmt = bo + ("Q" if bigtiff else "I")
     count_fmt = bo + ("Q" if bigtiff else "H")
-    actions: list[str] = []
+    actions = actions_list()
     kept: dict[int, list[dict[str, Any]]] = {}
     drop_ranges: list[tuple[int, int]] = []
     drop_ifd_ranges: list[tuple[int, int]] = []
@@ -1449,20 +1452,42 @@ def strip_tiff(data: bytes, *, strip_all_metadata: bool = True) -> tuple[bytes, 
     return bytes(out), actions
 
 
+# c2pa-rs fetches the XMP dcterms:provenance URL of an asset with no embedded
+# manifest (remote_manifest_fetch defaults to true) and resolves did:web, OCSP
+# and timestamp URLs named inside a manifest, so the inspected file would choose
+# which hosts the probe contacts. An explicit empty allowed_network_hosts list
+# makes the SDK's HTTP resolver refuse every URL.
+C2PATOOL_OFFLINE_SETTINGS = """\
+[core]
+allowed_network_hosts = []
+
+[verify]
+remote_manifest_fetch = false
+ocsp_fetch = false
+"""
+
+
 def run_optional_tools(path: Path, *, include_exiftool: bool = True) -> dict[str, Any]:
     tools: dict[str, Any] = {}
     c2patool = which("c2patool")
     if c2patool:
         try:
-            r = subprocess.run(
-                [c2patool, safe_arg(str(path))],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                preexec_fn=subprocess_preexec_fn,
-                check=False,
-                creationflags=subprocess_creationflags,
-            )
+            # c2patool falls back to its network-enabled defaults when
+            # --settings names a missing file, and loads trust sidecars from
+            # that file's directory: write it into a fresh private directory
+            # and let any failure here abort the probe.
+            with tempfile.TemporaryDirectory(prefix="wm-c2patool-") as settings_dir:
+                settings = Path(settings_dir) / "c2pa.toml"
+                settings.write_text(C2PATOOL_OFFLINE_SETTINGS, encoding="utf-8")
+                r = subprocess.run(
+                    [c2patool, "--settings", str(settings), safe_arg(str(path))],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    preexec_fn=subprocess_preexec_fn,
+                    check=False,
+                    creationflags=subprocess_creationflags,
+                )
             out = (r.stdout or "") + (r.stderr or "")
             low = out.lower()
             # Negative markers must veto every positive branch, so the
@@ -1889,6 +1914,8 @@ def inspect_image(
             False,
             ["unsupported format (PNG/JPEG/WebP/AVIF/HEIC/BMP/GIF/TIFF)"],
         )
+    # The parser's list is capped; the tool verdicts below must still show.
+    findings = list(findings)
 
     notes: list[str] = []
     if fmt == "unknown":
@@ -1940,7 +1967,7 @@ def _png_chunk(ctype: bytes, payload: bytes) -> bytes:
 def strip_png(data: bytes, *, strip_all_text: bool = True) -> tuple[bytes, list[str]]:
     if not data.startswith(PNG_SIG):
         raise ValueError("not PNG")
-    actions: list[str] = []
+    actions = actions_list()
     out = bytearray(PNG_SIG)
     pos = 8
     while pos + 8 <= len(data):
@@ -2004,7 +2031,7 @@ def strip_png(data: bytes, *, strip_all_text: bool = True) -> tuple[bytes, list[
 def strip_jpeg(data: bytes, *, strip_all_app: bool = True) -> tuple[bytes, list[str]]:
     if not data.startswith(JPEG_SOI):
         raise ValueError("not JPEG")
-    actions: list[str] = []
+    actions = actions_list()
     out = bytearray(JPEG_SOI)
     i = 2
     n = len(data)
@@ -2095,7 +2122,7 @@ def strip_webp(data: bytes, *, strip_all_metadata: bool = True) -> tuple[bytes, 
     if notes:
         raise ValueError("malformed WebP: " + "; ".join(notes))
 
-    actions: list[str] = []
+    actions = actions_list()
     kept: list[tuple[bytes, bytes, bytes]] = []
     removed_flags = 0
     metadata_flags = {b"ICCP": 0x20, b"EXIF": 0x08, b"XMP ": 0x04}
@@ -2138,7 +2165,7 @@ def strip_isobmff(
     # rebuild below used to emit only the boxes that parsed — dropping a
     # truncated mdat, the actual coded image, while reporting "already clean"
     # (#170); the tail is appended verbatim afterwards instead.
-    actions: list[str] = []
+    actions = actions_list()
     out = bytearray()
 
     for fourcc, payload, size, header_size in boxes:
@@ -2256,6 +2283,8 @@ def clean_image(
         cleaned, actions = strip_tiff(data, strip_all_metadata=strip_all_metadata)
     else:
         raise ValueError(f"unsupported format: {fmt}")
+    # The stripper's list is capped; the pass outcomes below must still show.
+    actions = list(actions)
 
     # Optional exiftool pass for residual tags
     safe_write_bytes(dest, cleaned)

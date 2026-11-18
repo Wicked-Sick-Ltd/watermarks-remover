@@ -10,6 +10,7 @@ remote URLs; download the assets and run audit_dir.py locally for those.
 from __future__ import annotations
 
 import argparse
+import functools
 import gzip
 import http.client
 import io
@@ -260,6 +261,73 @@ def _origin_allowed(candidate: UrlOrigin, expected: UrlOrigin) -> bool:
     )
 
 
+# A translator forwards these to the IPv4 address held in the low bits, which
+# ``is_global`` never inspects (it reports 64:ff9b::/96 as global).
+_IPV4_TRANSLATION_PREFIXES = (
+    ipaddress.IPv6Network("64:ff9b::/96"),  # RFC 6052 well-known NAT64 prefix
+    ipaddress.IPv6Network("64:ff9b:1::/48"),  # RFC 8215 local-use NAT64 prefix
+    ipaddress.IPv6Network("::ffff:0:0:0/96"),  # RFC 2765 SIIT IPv4-translated
+    ipaddress.IPv6Network("::/96"),  # RFC 4291 deprecated IPv4-compatible
+)
+_NAT64_DISCOVERY_NAME = "ipv4only.arpa"
+_NAT64_DISCOVERY_IPV4 = frozenset(
+    {ipaddress.IPv4Address("192.0.0.170"), ipaddress.IPv4Address("192.0.0.171")}
+)
+_RFC6052_PREFIX_LENGTHS = (32, 40, 48, 56, 64, 96)
+
+
+def _rfc6052_embedded_ipv4(
+    address: ipaddress.IPv6Address, prefix_len: int
+) -> ipaddress.IPv4Address | None:
+    """Return the IPv4 address embedded after an RFC 6052 prefix of this length."""
+    packed = address.packed
+    if prefix_len == 96:
+        return ipaddress.IPv4Address(packed[12:16])
+    # Bits 64-71 are reserved and must be zero for the shorter prefixes.
+    if packed[8] != 0:
+        return None
+    return ipaddress.IPv4Address((packed[prefix_len // 8 : 8] + packed[9:])[:4])
+
+
+@functools.lru_cache(maxsize=1)
+def _discovered_nat64_prefixes() -> tuple[ipaddress.IPv6Network, ...]:
+    """Return the NAT64 prefixes the local DNS64 resolver synthesizes (RFC 7050)."""
+    try:
+        infos = socket.getaddrinfo(_NAT64_DISCOVERY_NAME, None, socket.AF_INET6, socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return ()
+
+    prefixes: list[ipaddress.IPv6Network] = []
+    for info in infos:
+        try:
+            address = ipaddress.IPv6Address(str(info[4][0]).split("%", 1)[0])
+        except ValueError:
+            continue
+        for prefix_len in _RFC6052_PREFIX_LENGTHS:
+            if _rfc6052_embedded_ipv4(address, prefix_len) in _NAT64_DISCOVERY_IPV4:
+                network = ipaddress.IPv6Network((address, prefix_len), strict=False)
+                if network not in prefixes:
+                    prefixes.append(network)
+    return tuple(prefixes)
+
+
+def _is_public_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """True only for addresses whose actual destination is globally routable."""
+    if not address.is_global:
+        return False
+    if address.version == 4:
+        return True
+
+    if any(address in net for net in _IPV4_TRANSLATION_PREFIXES):
+        return False
+
+    embedded = [address.sixtofour, *(address.teredo or ())]
+    if any(ipv4 is not None and not ipv4.is_global for ipv4 in embedded):
+        return False
+
+    return not any(address in net for net in _discovered_nat64_prefixes())
+
+
 def _resolve_public_addresses(origin: UrlOrigin) -> tuple[str, ...]:
     """Resolve an origin to validated public numeric addresses."""
     _scheme, host, port = origin
@@ -288,7 +356,7 @@ def _resolve_public_addresses(origin: UrlOrigin) -> tuple[str, ...]:
         if mapped is not None:
             address = mapped
 
-        if not address.is_global:
+        if not _is_public_address(address):
             raise ValueError(f"refusing non-public address for {host}: {address}")
 
         canonical = str(address)

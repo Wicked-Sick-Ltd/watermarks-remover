@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -18,6 +19,8 @@ from common import (
     cleaned_path,
     eprint,
     guard_binary,
+    private_copy,
+    read_in_place_source,
     result_has_changes,
     safe_write_text,
 )
@@ -82,7 +85,11 @@ def main() -> int:
         help="Only report files that were modified or carry warnings/residuals",
     )
     args = p.parse_args()
+    with contextlib.ExitStack() as scratch:
+        return _clean(args, scratch)
 
+
+def _clean(args: argparse.Namespace, scratch: contextlib.ExitStack) -> int:
     # CLI opens the file the user named; no extra concatenation.
     if not args.path.is_file():  # nosemgrep: tainted-path-traversal-stdlib
         eprint(f"not a file: {args.path}")
@@ -92,6 +99,10 @@ def main() -> int:
     if args.path.stat().st_size > MAX_INPUT_BYTES:  # nosemgrep: tainted-path-traversal-stdlib
         eprint(f"refusing input larger than {MAX_INPUT_BYTES} bytes: {args.path}")
         return 2
+
+    # In place, every later step works on these bytes: the backup, the text
+    # clean, and the private copy the media cleaners read.
+    source = read_in_place_source(args.path, limit=MAX_INPUT_BYTES) if args.in_place else None
 
     # CLI opens the file the user named; no extra concatenation.
     kind = (
@@ -119,7 +130,7 @@ def main() -> int:
     if kind == "container":
         # CLI opens the file the user named; no extra concatenation.
         container_fmt = detect_container_format(
-            args.path, args.path.read_bytes()
+            args.path, source if source is not None else args.path.read_bytes()
         )  # nosemgrep: tainted-path-traversal-stdlib
         if container_fmt in {"docx", "xlsx", "pptx"}:
             owner_file = office_owner_file(args.path)
@@ -136,7 +147,7 @@ def main() -> int:
     # .bak sidecar behind for a file this run never touches.
     # CLI opens the file the user named; no extra concatenation.
     raw = (
-        args.path.read_bytes() if kind == "text" else None
+        (source if source is not None else args.path.read_bytes()) if kind == "text" else None
     )  # nosemgrep: tainted-path-traversal-stdlib
     if raw is not None:
         guard_binary(
@@ -146,14 +157,20 @@ def main() -> int:
             advice=ROUTER_ADVICE,
         )
 
+    reported_input = None
     if args.in_place:
-        bak, created = backup_path(args.path)
+        bak, created = backup_path(args.path, source)
         if not created and not args.quiet:
             eprint(f"backup {bak} already exists from an earlier run; keeping the original backup")
         # On a repeated in-place run the backup already holds the original
         # (pre-clean) bytes; process the current file so an already-clean
         # destination is not reported as modified against a stale .bak.
-        src = bak if created else args.path
+        reported_input = bak if created else args.path
+        src = (
+            args.path
+            if kind == "text"
+            else scratch.enter_context(private_copy(source, reported_input.name))
+        )
         dest = args.path
     else:
         src = args.path
@@ -203,6 +220,8 @@ def main() -> int:
             else result_has_changes(result)
         )
         result = {"kind": "image", "changed": is_changed, **result}
+        if reported_input is not None:
+            result["input"] = str(reported_input)
         residual = result["still_has_c2pa"] or result["still_has_ai_metadata"]
         is_changed = result.get("changed", False) or (result["bytes_in"] != result["bytes_out"])
         should_report = not args.quiet or is_changed or residual
@@ -239,6 +258,8 @@ def main() -> int:
             else result_has_changes(result)
         )
         result = {"kind": "av", "changed": is_changed, **result}
+        if reported_input is not None:
+            result["input"] = str(reported_input)
         residual = result["still_has_c2pa"] or result["still_has_ai_metadata"]
         is_changed = result.get("changed", False) or (result["bytes_in"] != result["bytes_out"])
         should_report = not args.quiet or is_changed or residual
@@ -276,6 +297,8 @@ def main() -> int:
         else result_has_changes(result)
     )
     result = {"kind": "container", "changed": is_changed, **result}
+    if reported_input is not None:
+        result["input"] = str(reported_input)
     residual = result["still_has_c2pa"] or result["still_has_ai_metadata"]
     degraded = bool(result.get("meta", {}).get("degraded"))
     is_changed = result.get("changed", False) or (result["bytes_in"] != result["bytes_out"])

@@ -26,6 +26,33 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 DEFAULT_SYNTHID_TEXT_TIMEOUT = 120.0
 
+DEFAULT_TEXT_MODEL = "facebook/opt-1.3b"
+
+
+def allowed_text_models(default_model: str = DEFAULT_TEXT_MODEL) -> frozenset[str]:
+    """Model ids a request may select: the operator default plus WATERMARKS_ALLOWED_TEXT_MODELS.
+
+    The model id is handed to ``from_pretrained``, which downloads and loads
+    whatever repository (or local directory) it names, so request bodies may
+    only pick from this operator-configured set.
+    """
+    raw = os.environ.get("WATERMARKS_ALLOWED_TEXT_MODELS", "")
+    extra = {m.strip() for m in raw.split(",") if m.strip()}
+    return frozenset({default_model, *extra})
+
+
+def resolve_text_model(requested: Any, default_model: str = DEFAULT_TEXT_MODEL) -> str:
+    """Return the model id to load for a request, refusing ids outside the allowlist."""
+    if requested is None:
+        return default_model
+    if not isinstance(requested, str) or requested not in allowed_text_models(default_model):
+        raise ValueError(
+            "'model' is not an allowed text watermark model "
+            "(the operator can extend WATERMARKS_ALLOWED_TEXT_MODELS)"
+        )
+    return requested
+
+
 ALLOWED_WATERMARK_OPTIONS: frozenset[str] = frozenset(
     {
         "scheme",
@@ -42,8 +69,12 @@ ALLOWED_WATERMARK_OPTIONS: frozenset[str] = frozenset(
 )
 
 
-def parse_watermark_options(raw: Any) -> dict[str, Any]:
-    """Validate and sanitize text watermarking options against the documented contract."""
+def parse_watermark_options(raw: Any, *, default_model: str = DEFAULT_TEXT_MODEL) -> dict[str, Any]:
+    """Validate and sanitize text watermarking options against the documented contract.
+
+    ``default_model`` is the model the backend loads when ``model`` is omitted;
+    it is always allowed alongside ``WATERMARKS_ALLOWED_TEXT_MODELS``.
+    """
     if raw is None:
         return {}
     if not isinstance(raw, dict):
@@ -63,7 +94,7 @@ def parse_watermark_options(raw: Any) -> dict[str, Any]:
         model = raw["model"]
         if not isinstance(model, str) or not model.strip():
             raise ValueError("'model' must be a non-empty string")
-        parsed["model"] = model.strip()
+        parsed["model"] = resolve_text_model(model.strip(), default_model)
 
     if "seed" in raw:
         val = raw["seed"]
@@ -351,6 +382,12 @@ def _watermark_local_markllm(
             "error_code": "timeout",
         }
 
+    opts = options or {}
+    try:
+        model = resolve_text_model(opts.get("model"))
+    except ValueError as e:
+        return {"ok": False, "kind": "text", "error": str(e), "error_code": "client_error"}
+
     from detect_text_watermark import (
         _load_algorithm,
         _resolve_config,
@@ -358,7 +395,6 @@ def _watermark_local_markllm(
         resolve_upstream,
     )
 
-    opts = options or {}
     alg = opts.get("scheme", "synthid").lower()
     from detect_text_watermark import SCHEMES
 
@@ -374,7 +410,6 @@ def _watermark_local_markllm(
         }
 
     device = resolve_device(opts.get("device"))
-    model = opts.get("model", "facebook/opt-1.3b")
 
     try:
         cfg_opt = opts.get("config")

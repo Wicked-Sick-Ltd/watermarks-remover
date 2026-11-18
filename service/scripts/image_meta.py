@@ -492,58 +492,127 @@ def inspect_jpeg(data: bytes) -> tuple[bool, bool, list[str]]:
     return has_c2pa, has_ai or has_c2pa, findings
 
 
-def _webp_chunks(data: bytes) -> tuple[list[tuple[bytes, bytes, bytes]], list[str]]:
-    if detect_format(data) != "webp":
-        return [], ["not a WebP"]
+def _u32le(data: bytes | bytearray, pos: int) -> int:
+    """Read a little-endian uint32 without copying a slice."""
+    return data[pos] | (data[pos + 1] << 8) | (data[pos + 2] << 16) | (data[pos + 3] << 24)
 
-    notes = findings_list()
-    declared_size = struct.unpack("<I", data[4:8])[0]
+
+def _fourcc_at(data: bytes | bytearray, pos: int) -> int:
+    return _u32le(data, pos)
+
+
+def _fourcc_code(raw: bytes) -> int:
+    return raw[0] | (raw[1] << 8) | (raw[2] << 16) | (raw[3] << 24)
+
+
+def _fourcc_upper(data: bytes | bytearray, pos: int) -> int:
+    """ASCII-uppercase fourcc. Indexing avoids a per-chunk bytes copy."""
+
+    def up(byte: int) -> int:
+        return byte - 32 if 97 <= byte <= 122 else byte
+
+    return (
+        up(data[pos])
+        | (up(data[pos + 1]) << 8)
+        | (up(data[pos + 2]) << 16)
+        | (up(data[pos + 3]) << 24)
+    )
+
+
+_FCC_C2PA = _fourcc_code(b"C2PA")
+_FCC_EXIF = _fourcc_code(b"EXIF")
+_FCC_XMP = _fourcc_code(b"XMP ")
+_FCC_ICCP = _fourcc_code(b"ICCP")
+_FCC_VP8X = _fourcc_code(b"VP8X")
+# VP8X feature bits cleared when the matching metadata chunk is removed.
+_WEBP_META_FLAGS = {_FCC_ICCP: 0x20, _FCC_EXIF: 0x08, _FCC_XMP: 0x04}
+
+
+def _webp_chunk_name(data: bytes | bytearray, pos: int) -> str:
+    return data[pos : pos + 4].decode("latin-1", errors="replace")
+
+
+def _webp_chunk_drop(
+    data: bytes | bytearray, pos: int, length: int, *, strip_all_metadata: bool
+) -> tuple[bool, int]:
+    """Whether this chunk is metadata to remove, and the VP8X flag bit it owns."""
+    if _fourcc_upper(data, pos) == _FCC_C2PA:
+        return True, 0
+    bits = _WEBP_META_FLAGS.get(_fourcc_at(data, pos), 0)
+    if not bits:
+        return False, 0
+    if strip_all_metadata:
+        return True, bits
+    payload = data[pos + 8 : pos + 8 + length]
+    if _contains_any(payload, AI_META_HINTS + C2PA_MARKERS):
+        return True, bits
+    return False, 0
+
+
+def _walk_webp(data: bytes | bytearray, notes: list[str], on_chunk) -> bool:
+    """Visit each well-formed RIFF chunk without retaining it.
+
+    Returns False when ``data`` is not a WebP (and appends ``not a WebP``).
+    Structural problems are appended to ``notes``. ``on_chunk(pos, length,
+    padded_end)`` runs only for chunks that fit. The walk indexes the original
+    buffer, so a file of empty chunks does not allocate one object per chunk.
+    """
+    if detect_format(data) != "webp":
+        notes.append("not a WebP")
+        return False
+
+    declared_size = _u32le(data, 4)
     if declared_size + 8 != len(data):
         notes.append(f"RIFF size mismatch: header={declared_size + 8} actual={len(data)}")
 
-    chunks: list[tuple[bytes, bytes, bytes]] = []
     pos = 12
     while pos + 8 <= len(data):
-        fourcc = data[pos : pos + 4]
-        length = struct.unpack("<I", data[pos + 4 : pos + 8])[0]
-        payload_start = pos + 8
-        payload_end = payload_start + length
+        length = _u32le(data, pos + 4)
+        payload_end = pos + 8 + length
         padded_end = payload_end + (length & 1)
         if padded_end > len(data):
-            name = fourcc.decode("latin-1", errors="replace")
-            notes.append(f"truncated WebP chunk {name}")
+            notes.append(f"truncated WebP chunk {_webp_chunk_name(data, pos)}")
             break
-        chunks.append((fourcc, data[payload_start:payload_end], data[payload_end:padded_end]))
+        on_chunk(pos, length, padded_end)
         pos = padded_end
     if pos != len(data) and not any("truncated" in note for note in notes):
         notes.append(f"trailing WebP bytes: {len(data) - pos}")
-    return chunks, notes
+    return True
 
 
 def inspect_webp(data: bytes) -> tuple[bool, bool, list[str]]:
-    chunks, findings = _webp_chunks(data)
-    if not chunks and findings == ["not a WebP"]:
-        return False, False, findings
+    """Report C2PA / AI metadata chunks.
 
+    Chunks are visited in place. A WebP of many empty RIFF chunks stays under
+    the request cap and must not build a list of one object per chunk.
+    """
+    findings = findings_list()
     has_c2pa = False
     has_ai = False
-    for fourcc, payload, _padding in chunks:
-        name = fourcc.decode("latin-1", errors="replace")
-        if fourcc.upper() == b"C2PA":
+
+    def on_chunk(pos: int, length: int, _padded_end: int) -> None:
+        nonlocal has_c2pa, has_ai
+        if _fourcc_upper(data, pos) == _FCC_C2PA:
             has_c2pa = True
             has_ai = True
             findings.append("WebP C2PA chunk")
-            continue
-        if fourcc in (b"XMP ", b"EXIF"):
-            hits = _contains_any(payload, AI_META_HINTS + C2PA_MARKERS)
-            if hits:
-                has_ai = True
-                if any(
-                    hit.lower() in ("c2pa", "contentcredentials", "jumb", "contentauth")
-                    for hit in hits
-                ):
-                    has_c2pa = True
-                findings.append(f"WebP {name}: {', '.join(hits[:8])}")
+            return
+        if _fourcc_at(data, pos) not in (_FCC_XMP, _FCC_EXIF):
+            return
+        name = _webp_chunk_name(data, pos)
+        payload = data[pos + 8 : pos + 8 + length]
+        hits = _contains_any(payload, AI_META_HINTS + C2PA_MARKERS)
+        if not hits:
+            return
+        has_ai = True
+        if any(
+            hit.lower() in ("c2pa", "contentcredentials", "jumb", "contentauth") for hit in hits
+        ):
+            has_c2pa = True
+        findings.append(f"WebP {name}: {', '.join(hits[:8])}")
+
+    if not _walk_webp(data, findings, on_chunk):
+        return False, False, findings
     return has_c2pa, has_ai or has_c2pa, findings
 
 
@@ -2116,40 +2185,46 @@ def strip_jpeg(data: bytes, *, strip_all_app: bool = True) -> tuple[bytes, list[
 
 
 def strip_webp(data: bytes, *, strip_all_metadata: bool = True) -> tuple[bytes, list[str]]:
-    chunks, notes = _webp_chunks(data)
-    if not chunks and notes == ["not a WebP"]:
+    """Drop C2PA / metadata chunks without retaining every RIFF chunk.
+
+    A file that loses nothing is returned as the original buffer. Rebuilding
+    every empty chunk into a second copy would spend the memory the caller is
+    trying not to hold.
+    """
+    notes = findings_list()
+    removed_flags = 0
+    dropped = False
+
+    def preview(pos: int, length: int, _padded_end: int) -> None:
+        nonlocal removed_flags, dropped
+        drop, bits = _webp_chunk_drop(data, pos, length, strip_all_metadata=strip_all_metadata)
+        if drop:
+            dropped = True
+            removed_flags |= bits
+
+    if not _walk_webp(data, notes, preview):
         raise ValueError("not WebP")
     if notes:
         raise ValueError("malformed WebP: " + "; ".join(notes))
 
     actions = actions_list()
-    kept: list[tuple[bytes, bytes, bytes]] = []
-    removed_flags = 0
-    metadata_flags = {b"ICCP": 0x20, b"EXIF": 0x08, b"XMP ": 0x04}
-
-    for fourcc, payload, padding in chunks:
-        drop = fourcc.upper() == b"C2PA"
-        if fourcc in metadata_flags:
-            drop = strip_all_metadata or bool(_contains_any(payload, AI_META_HINTS + C2PA_MARKERS))
-        if drop:
-            name = fourcc.decode("latin-1", errors="replace")
-            actions.append(f"drop WebP chunk {name}")
-            removed_flags |= metadata_flags.get(fourcc, 0)
-        else:
-            kept.append((fourcc, payload, padding))
+    if not dropped:
+        actions.append("no WebP metadata chunks removed (already clean or none matched)")
+        return data, actions
 
     body = bytearray(WEBP_SIG)
-    for fourcc, payload, padding in kept:
-        chunk = payload
-        if fourcc == b"VP8X" and len(chunk) >= 1 and removed_flags:
-            chunk = bytes([chunk[0] & ~removed_flags]) + chunk[1:]
-        body.extend(fourcc)
-        body.extend(struct.pack("<I", len(chunk)))
-        body.extend(chunk)
-        body.extend(padding if len(chunk) & 1 else b"")
 
-    if not actions:
-        actions.append("no WebP metadata chunks removed (already clean or none matched)")
+    def rebuild(pos: int, length: int, padded_end: int) -> None:
+        drop, _bits = _webp_chunk_drop(data, pos, length, strip_all_metadata=strip_all_metadata)
+        if drop:
+            actions.append(f"drop WebP chunk {_webp_chunk_name(data, pos)}")
+            return
+        start = len(body)
+        body.extend(data[pos:padded_end])
+        if _fourcc_at(data, pos) == _FCC_VP8X and length >= 1 and removed_flags:
+            body[start + 8] = body[start + 8] & ~removed_flags
+
+    _walk_webp(data, findings_list(), rebuild)
     return WEBP_RIFF + struct.pack("<I", len(body)) + bytes(body), actions
 
 

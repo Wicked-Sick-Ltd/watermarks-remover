@@ -104,6 +104,8 @@ def _peak(fn) -> int:
     try:
         fn()
     except ValueError:
+        # Malformed-input refusal is expected during this measurement.
+        # The peak is what the assertion checks, including a cap that raises.
         pass
     finally:
         _current, peak = tracemalloc.get_traced_memory()

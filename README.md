@@ -379,8 +379,10 @@ Each report's `findings`, `actions`, and `post_findings` list keeps at most `WAT
 WM="http://127.0.0.1:8765"
 curl -s "$WM/health"                       # {"ok": true, "version": "..."}
 curl -s "$WM/openapi.json"                 # machine-readable OpenAPI 3.0.3 contract
-curl -s -X POST "$WM/clean" -H 'Content-Type: application/json' \
-  -d "{\"file\": \"$(base64 < notes.md | tr -d '\n')\", \"name\": \"notes.md\"}"
+src=notes.md   # a path is data: only ever expand it as "$src"
+name=$(printf '%s' "${src##*/}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')
+{ printf '{"file": "'; base64 < "$src" | tr -d '\n'; printf '", "name": "%s"}' "$name"; } |
+  curl -s -X POST "$WM/clean" -H 'Content-Type: application/json' --data-binary @-
 ```
 
 The service routes by filename extension then magic bytes, so text / image / container are auto-detected. Set `WATERMARKS_SERVER_API_KEY` to require `Authorization: Bearer <key>` on every request; it is mandatory when `MARKLLM_DIR` is set (the service refuses to start, and refuses requests, without it). Loopback-only bind by default (`--host` to override); intended for a trusted network.
@@ -479,8 +481,8 @@ the `WATERMARKS_REWRITE_*` LLM config (for the `paraphrase` step):
 
 ```bash
 echo "Hello\u200bWorld\u00ad!" > /tmp/sample.txt
-curl -s -X POST http://127.0.0.1:8765/clean -H 'Content-Type: application/json' \
-  -d "{\"file\": \"$(base64 < /tmp/sample.txt | tr -d '\n')\", \"name\": \"sample.txt\"}"
+{ printf '{"file": "'; base64 < /tmp/sample.txt | tr -d '\n'; printf '", "name": "sample.txt"}'; } |
+  curl -s -X POST http://127.0.0.1:8765/clean -H 'Content-Type: application/json' --data-binary @-
 ```
 
 Languages whose typography relies on a non-breaking space (French `« … »`, the

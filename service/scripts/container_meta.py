@@ -26,9 +26,11 @@ from typing import Any
 from xml.etree import ElementTree as ET
 
 from common import (
+    actions_list,
     c2patool_probe_note,
     classify_finding_confidence,
     confined_path,
+    findings_list,
     safe_arg,
     safe_write_bytes,
     safe_write_text,
@@ -347,7 +349,7 @@ def detect_container_format(path: Path, data: bytes | None = None) -> str:
 
 def _blob_hits(blob: bytes) -> tuple[bool, bool, list[str]]:
     lower = blob.lower()
-    findings: list[str] = []
+    findings = findings_list()
     has_c2pa = False
     has_ai = False
     for n in C2PA_MARKERS:
@@ -439,7 +441,7 @@ def _skip_data_uri_candidate(text: str, start: int) -> int:
 def _inspect_embedded_data_uris(text: str) -> tuple[bool, bool, list[str]]:
     has_c2pa = False
     has_ai = False
-    findings: list[str] = []
+    findings = findings_list()
 
     for _start, _end, mime, params, payload in _iter_data_uris(text):
         mime_l = mime.lower()
@@ -488,7 +490,7 @@ def _inspect_embedded_data_uris(text: str) -> tuple[bool, bool, list[str]]:
 def _clean_embedded_data_uris(
     text: str, *, strip_all_metadata: bool = True
 ) -> tuple[str, list[str]]:
-    actions: list[str] = []
+    actions = actions_list()
 
     def _clean_one(mime: str, params: str, payload: str) -> str | None:
         """Return the rebuilt data URI, or None when nothing changed."""
@@ -798,10 +800,20 @@ def _is_agent_frontmatter(keys: list[str]) -> bool:
 
 
 def inspect_markdown(text: str) -> tuple[bool, bool, list[str], dict]:
-    findings: list[str] = []
+    findings = findings_list()
     has_ai = False
     has_fm = False
+    c2pa_hint = False
     keys = []
+
+    # Judged per entry: the capped list may not keep every finding.
+    def note(finding: str) -> None:
+        nonlocal c2pa_hint
+        low = finding.lower()
+        if "c2pa" in low or "content" in low:
+            c2pa_hint = True
+        findings.append(finding)
+
     m = _FM_RE.match(text)
     if m:
         has_fm = True
@@ -815,13 +827,13 @@ def inspect_markdown(text: str) -> tuple[bool, bool, list[str], dict]:
                 pass  # agent configuration, not provenance -- value still checked below
             elif key.lower() in AI_FRONTMATTER_KEYS or AI_META_NAME_RE.search(key):
                 has_ai = True
-                findings.append(f"frontmatter key: {key}")
+                note(f"frontmatter key: {key}")
             # also check value -- it may span continuation lines (block
             # scalars, wrapped values, list items), so scan the joined text
             val = _fm_joined_value(rows, idx, block_lines)
             if named_value_is_ai(key, val):
                 has_ai = True
-                findings.append(f"frontmatter value hit on {key}")
+                note(f"frontmatter value hit on {key}")
 
     comment_c2pa = False
     comments = _FindingSampler(findings, "comment", "provenance comments")
@@ -839,18 +851,15 @@ def inspect_markdown(text: str) -> tuple[bool, bool, list[str], dict]:
         has_ai = True
     if uri_ai:
         has_ai = True
-    findings.extend(uri_findings)
+    for finding in uri_findings:
+        note(finding)
 
-    c2pa = (
-        uri_c2pa
-        or comment_c2pa
-        or any("c2pa" in f.lower() or "content" in f.lower() for f in findings)
-    )
+    c2pa = uri_c2pa or c2pa_hint or comment_c2pa
     return c2pa, has_ai, findings, {"has_frontmatter": has_fm, "keys": keys}
 
 
 def clean_markdown(text: str) -> tuple[str, list[str]]:
-    actions: list[str] = []
+    actions = actions_list()
     m = _FM_RE.match(text)
     if m:
         block = m.group(1)
@@ -1359,7 +1368,7 @@ def inspect_latex(text: str) -> tuple[bool, bool, list[str], dict]:
     dropped-entry counts. Skips % comments and verbatim/listings content so
     only live \hypersetup/\pdfinfo metadata and literal comment lines are seen.
     """
-    findings: list[str] = []
+    findings = findings_list()
     has_ai = False
     has_c2pa = False
     keys_dropped = 0
@@ -1404,7 +1413,7 @@ def clean_latex(text: str) -> tuple[str, list[str]]:
     % comments plus % !TEX tooling comments and Emacs/Vim modelines. Verbatim and
     listings content is left untouched. Returns (text, actions).
     """
-    actions: list[str] = []
+    actions = actions_list()
     out: list[str] = []
     last = 0
     for cmd, arg, start, end in _latex_iter_meta_commands(text):
@@ -1684,7 +1693,7 @@ def _script_tag_is_jsonld(open_tag: str) -> bool:
 
 
 def inspect_html(text: str) -> tuple[bool, bool, list[str], dict]:
-    findings: list[str] = []
+    findings = findings_list()
     has_ai = False
     has_c2pa = False
     cms_metas = _FindingSampler(findings, "info: cms generator", "generator meta tags")
@@ -1739,7 +1748,7 @@ def inspect_html(text: str) -> tuple[bool, bool, list[str], dict]:
 
 
 def clean_html(text: str) -> tuple[str, list[str]]:
-    actions: list[str] = []
+    actions = actions_list()
 
     def _meta_sub(m: re.Match[str]) -> str:
         tag = m.group(0)
@@ -1809,7 +1818,7 @@ _SVG_COMMENT_CLOSE_RE = re.compile(r"--!?>")
 
 
 def inspect_svg(data: bytes) -> tuple[bool, bool, list[str], dict]:
-    findings: list[str] = []
+    findings = findings_list()
     has_c2pa, has_ai, hits = _blob_hits(data)
     findings.extend(hits)
     try:
@@ -2045,7 +2054,7 @@ def clean_svg(data: bytes) -> tuple[bytes, list[str]]:
     the document body, CDATA sections, comments, and quoted attribute values are
     preserved.
     """
-    actions: list[str] = []
+    actions = actions_list()
     text = data.decode("utf-8", errors="surrogateescape")
     # Drop metadata blocks (linear scan - lazy .*? is quadratic on unclosed tags)
     new, n = _drop_tag_blocks(text, _SVG_METADATA_OPEN_RE, _SVG_METADATA_CLOSE_RE)
@@ -2201,7 +2210,7 @@ class _WebExtensionFindingsTarget:
 
 def _webextension_findings(name: str, raw: bytes) -> list[str]:
     """Report Office add-in properties and references without scanning body text."""
-    findings: list[str] = []
+    findings = findings_list()
 
     def on_start(tag: str, attributes: dict[str, str]) -> None:
         local_name = tag.rsplit("}", 1)[-1].casefold()
@@ -2242,7 +2251,7 @@ def _webextension_findings(name: str, raw: bytes) -> list[str]:
 def _inspect_ooxml_zip(
     data: bytes, fmt: str, budget: list[int] | None = None
 ) -> tuple[bool, bool, list[str], dict]:
-    findings: list[str] = []
+    findings = findings_list()
     has_c2pa = False
     has_ai = False
     parts: list[str] = []
@@ -2764,7 +2773,7 @@ def _scrub_ooxml_zip(
     when requested. Binary docProps members (e.g. the thumbnail) are kept
     byte-safe. Returns the rewritten bytes and a list of human-readable actions.
     """
-    actions: list[str] = []
+    actions = actions_list()
     budget = [0]
     layer_removed = 0
     layer_replaced = 0
@@ -2964,7 +2973,7 @@ def clean_pptx(
 
 
 def inspect_odt(data: bytes) -> tuple[bool, bool, list[str], dict]:
-    findings: list[str] = []
+    findings = findings_list()
     has_c2pa = False
     has_ai = False
     budget = [0]
@@ -3001,7 +3010,7 @@ def inspect_odt(data: bytes) -> tuple[bool, bool, list[str], dict]:
 def clean_odt(
     data: bytes, *, also_layer_a_text: bool = True, normalize_spaces: bool = True
 ) -> tuple[bytes, list[str]]:
-    actions: list[str] = []
+    actions = actions_list()
     budget = [0]
     layer_removed = 0
     layer_replaced = 0
@@ -3137,7 +3146,7 @@ def _epub_encrypted_parts(data: bytes) -> set[str]:
 
 
 def inspect_epub(data: bytes) -> tuple[bool, bool, list[str], dict]:
-    findings: list[str] = []
+    findings = findings_list()
     has_c2pa = False
     has_ai = False
     budget = [0]
@@ -3209,7 +3218,7 @@ _DC_FIELDS_CLOSE_RE = re.compile(
 
 def _scrub_epub_opf(text: str) -> tuple[str, list[str]]:
     """Scrub AI-ish metadata from the EPUB package document (OPF)."""
-    actions: list[str] = []
+    actions = actions_list()
 
     def _meta(m: re.Match[str]) -> str:
         tag = m.group(0)
@@ -3283,7 +3292,7 @@ def clean_epub(
     """
     from text_unicode import clean_text  # local import to avoid cycles
 
-    actions: list[str] = []
+    actions = actions_list()
     budget = [0]
     layer_removed = 0
     layer_replaced = 0
@@ -3439,7 +3448,7 @@ def inspect_pdf(
     include_attachments: bool = True,
     deadline: "_Deadline | None" = None,
 ) -> tuple[bool, bool, list[str], dict]:
-    findings: list[str] = []
+    findings = findings_list()
     has_c2pa, has_ai, hits = _blob_hits(_pdf_structured_blob(data))
     findings.extend(f"pdf-structured:{h}" for h in hits)
     # XMP packet scan
@@ -4382,7 +4391,7 @@ def clean_pdf(
       markers; recurse with the same rule.
     * ``"never"`` -- leave attachments untouched.
     """
-    actions: list[str] = []
+    actions = actions_list()
     data = path.read_bytes()
     dest.parent.mkdir(parents=True, exist_ok=True)
 
@@ -4743,7 +4752,9 @@ def clean_container(
 
     data = path.read_bytes()
     fmt = fmt or detect_container_format(path, data)
-    actions: list[str] = []
+    # Each format branch assigns this. An empty actions_list() here is a dead
+    # store: every path overwrites it, or raises, before the result is read.
+    actions: list[str]
     if fmt in {"docx", "xlsx", "pptx"}:
         owner_file = office_owner_file(path)
         if owner_file is not None:

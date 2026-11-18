@@ -10,7 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Hashable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +19,10 @@ from typing import Any
 # The env overrides remain as an explicit escape hatch.
 MAX_INPUT_BYTES = int(os.environ.get("WATERMARKS_MAX_INPUT_BYTES", str(256 << 20)))
 MAX_STDIN_BYTES = int(os.environ.get("WATERMARKS_MAX_STDIN_BYTES", str(64 << 20)))
+# Inspectors and strippers record one finding/action per flagged chunk,
+# segment, box or tag, and a file can repeat a 4-12 byte element millions of
+# times. Past this many entries a report only counts what it omitted.
+MAX_REPORT_ENTRIES = int(os.environ.get("WATERMARKS_MAX_REPORT_ENTRIES", "200"))
 
 # Exit codes shared by the audit CLIs. 0 = clean, 1 = actionable findings,
 # 2 = usage/refusal error, 3 = partial scan (some files/URLs failed to
@@ -31,6 +35,166 @@ EXIT_PARTIAL = 3
 # exhaust host memory or fill the disk.
 _CHILD_RLIMIT_AS = int(os.environ.get("WATERMARKS_CHILD_RLIMIT_AS", str(4 << 30)))
 _CHILD_RLIMIT_FSIZE = int(os.environ.get("WATERMARKS_CHILD_RLIMIT_FSIZE", str(2 << 30)))
+
+
+class ReportList(list):
+    """A findings/actions list holding at most ``cap`` ordinary entries.
+
+    Past the cap, an entry is still stored when ``key(entry)`` differs from
+    every stored entry's key, so whatever callers derive from the set of
+    keys (a finding's confidence class, whether an action mutated the file)
+    is unchanged; at most one extra entry per distinct key. Every other
+    entry is counted, not stored, in one trailing summary entry. The summary
+    starts with "no " so action filters read it as a non-change.
+    """
+
+    # Mutable, like list. Equality is explicit so the cap state below participates.
+    __hash__ = None
+
+    def __init__(
+        self,
+        iterable: Any = (),
+        *,
+        cap: int | None = None,
+        key: Callable[[Any], Hashable] | None = None,
+    ) -> None:
+        super().__init__()
+        self.cap = MAX_REPORT_ENTRIES if cap is None else max(0, cap)
+        self.key = key
+        self.omitted = 0
+        self._keys: set[Hashable] = set()
+        self._last: tuple[Any, Hashable] | None = None
+        self.extend(iterable)
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        # The default list-subclass reduce restores state before re-adding
+        # items through append(), which would re-count stored entries.
+        return (
+            _rebuild_report_list,
+            (list(self), self.cap, self.key, self.omitted, set(self._keys)),
+        )
+
+    def __eq__(self, other: object) -> bool:
+        # A plain list compares by contents only, so existing `entries == [...]`
+        # checks keep working. Another ReportList also compares the cap state
+        # that list equality would ignore. Anything else is left to the other
+        # operand.
+        if isinstance(other, ReportList):
+            # ``_last`` is only a lookup cache, so it is not part of equality.
+            return list.__eq__(self, other) is True and (
+                self.cap == other.cap
+                and self.key == other.key
+                and self.omitted == other.omitted
+                and self._keys == other._keys
+            )
+        if isinstance(other, list):
+            return list.__eq__(self, other) is True
+        return NotImplemented
+
+    def __ne__(self, other: object) -> bool:
+        # list.__ne__ only compares contents. Inverting __eq__ keeps != aligned
+        # with the cap state that __eq__ now includes.
+        equal = self.__eq__(other)
+        if equal is NotImplemented:
+            return NotImplemented
+        return not equal
+
+    def _summary(self) -> str:
+        return f"no further entries listed: {self.omitted} omitted (report capped at {self.cap})"
+
+    def _note_omitted(self, count: int) -> None:
+        if count <= 0:
+            return
+        had_summary = self.omitted > 0
+        self.omitted += count
+        summary = self._summary()
+        if had_summary:
+            self[-1] = summary
+        else:
+            super().append(summary)
+
+    def _key_of(self, item: Any) -> Hashable:
+        if self.key is None:
+            return None
+        if self._last is not None and self._last[0] == item:
+            return self._last[1]
+        k = self.key(item)
+        self._last = (item, k)
+        return k
+
+    def append(self, item: Any) -> None:
+        k = self._key_of(item)
+        if not self.omitted and len(self) < self.cap:
+            super().append(item)
+            self._keys.add(k)
+            return
+        if self.key is not None and k not in self._keys:
+            self._keys.add(k)
+            if self.omitted:
+                super().insert(len(self) - 1, item)
+            else:
+                super().append(item)
+            return
+        self._note_omitted(1)
+
+    def extend(self, iterable: Any) -> None:
+        for item in iterable:
+            self.append(item)
+
+    def __iadd__(self, iterable: Any) -> ReportList:
+        self.extend(iterable)
+        return self
+
+    def extend_capped(self, other: Any) -> None:
+        """Append *other* so two capped reports stay under this list's one cap.
+
+        ``left + right`` builds a plain list, so each side keeps its own
+        omitted summary and the cap applies twice. Stored entries are
+        appended (the other list's summary line is not) and its omitted
+        count is added to this one.
+        """
+        extra = 0
+        if isinstance(other, ReportList):
+            items = list(other)
+            extra = other.omitted
+            if extra and items:
+                items = items[:-1]
+        else:
+            items = list(other)
+        for item in items:
+            self.append(item)
+        self._note_omitted(extra)
+
+    def insert(self, index: Any, item: Any) -> None:
+        if not self.omitted and len(self) < self.cap:
+            super().insert(index, item)
+            self._keys.add(self._key_of(item))
+        else:
+            self.append(item)
+
+
+def _rebuild_report_list(
+    items: list[Any],
+    cap: int,
+    key: Callable[[Any], Hashable] | None,
+    omitted: int,
+    keys: set[Hashable],
+) -> ReportList:
+    rebuilt = ReportList(cap=cap, key=key)
+    list.extend(rebuilt, items)
+    rebuilt.omitted = omitted
+    rebuilt._keys = keys
+    return rebuilt
+
+
+def findings_list() -> ReportList:
+    """Capped findings list that keeps every confidence class it sees."""
+    return ReportList(key=classify_finding_confidence)
+
+
+def actions_list() -> ReportList:
+    """Capped actions list that keeps a mutating action if one occurs."""
+    return ReportList(key=is_mutating_action)
 
 
 def eprint(*args: object) -> None:

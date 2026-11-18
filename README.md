@@ -373,6 +373,8 @@ The same machinery runs as a stdlib HTTP service (`service/scripts/server.py`) â
 
 Batch endpoints loop the same per-file pipeline as `/inspect`, `/detect`, `/clean`, and `/watermark`, capped at `WATERMARKS_MAX_BATCH_FILES` files per request (default 50). A malformed entry (bad base64, unknown option, unrecognized format) surfaces as that entry's `"ok": false` with an `"error"` string â€” it never aborts the rest of the batch.
 
+Each report's `findings`, `actions`, and `post_findings` list keeps at most `WATERMARKS_MAX_REPORT_ENTRIES` parser entries (default 200). A file that repeats a flagged chunk, segment, box, or tag more often ends that list with one `"no further entries listed: N omitted (report capped at 200)"` entry. Past the cap, the first finding of any confidence class not yet listed, and the first mutating action, are still kept, so audit verdicts do not change. The cleaner still drops every matching element, and verdict flags such as `has_c2pa` are unaffected.
+
 ```bash
 WM="http://127.0.0.1:8765"
 curl -s "$WM/health"                       # {"ok": true, "version": "..."}

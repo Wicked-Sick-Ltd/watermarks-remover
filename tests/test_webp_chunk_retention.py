@@ -366,8 +366,12 @@ def test_http_webp_does_not_retain_every_empty_chunk(path, conn, monkeypatch):
 
     No API key is required unless one is configured. Clearing it here forces
     the default open check so a developer env key cannot hide the parser.
+    ``MARKLLM_DIR`` makes that empty key refuse every request, so a 401 would
+    pass the memory comparison without parsing. It is cleared, and a non-200
+    response fails the test.
     """
     monkeypatch.setattr(server, "API_KEY", "")
+    monkeypatch.delenv("MARKLLM_DIR", raising=False)
     bomb = _empty_chunk_webp(CHUNK_COUNT)
     control = _single_payload_webp(len(bomb))
     assert len(bomb) <= server.MAX_INPUT_BYTES
@@ -378,13 +382,16 @@ def test_http_webp_does_not_retain_every_empty_chunk(path, conn, monkeypatch):
         body = {"files": [payload]} if path.endswith("/batch") else payload
         raw = json.dumps(body).encode("utf-8")
         assert len(raw) <= server.MAX_BODY_BYTES
-        _post(conn, path, body)
+        status, response = _post(conn, path, body)
+        assert status == 200, response
+        assert response.get("ok") is True
 
     _assert_same_size(path, invoke, bomb, control)
 
 
 def test_http_marked_webp_is_still_inspected(conn, monkeypatch):
     monkeypatch.setattr(server, "API_KEY", "")
+    monkeypatch.delenv("MARKLLM_DIR", raising=False)
     status, body = _post(conn, "/inspect", {"file": _b64(_marked_webp()), "name": "shot.webp"})
     assert status == 200
     assert body["report"]["has_c2pa"] is True

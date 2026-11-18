@@ -24,6 +24,7 @@ A recipe passes only when none of the payloads below create ``CANARY``.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shutil
@@ -166,7 +167,9 @@ def bind_caller_path(body: str, payload: str) -> tuple[str, dict[str, str]]:
 def _run_recipe(body: str, payload: str) -> Path:
     """Run ``body`` with ``payload`` bound as the caller path. Return the work dir."""
     work = Path(tempfile.mkdtemp(prefix="wm-skill-path-"))
-    (work / payload).write_bytes(b"downloaded file")
+    # A double quote is not a legal Windows file name. The recipe still runs.
+    with contextlib.suppress(OSError):
+        (work / payload).write_bytes(b"downloaded file")
     script, env = bind_caller_path(body, payload)
     child = os.environ.copy()
     child.pop("WATERMARKS_SERVER_API_KEY", None)

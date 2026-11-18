@@ -217,12 +217,11 @@ def _peak_rss_kib() -> int:
         raise RuntimeError("VmHWM missing from /proc/self/status")
     if sys.platform == "win32":
         import ctypes
-        from ctypes import wintypes
 
         class _Counters(ctypes.Structure):
             _fields_ = [
-                ("cb", wintypes.DWORD),
-                ("PageFaultCount", wintypes.DWORD),
+                ("cb", ctypes.wintypes.DWORD),
+                ("PageFaultCount", ctypes.wintypes.DWORD),
                 ("PeakWorkingSetSize", ctypes.c_size_t),
                 ("WorkingSetSize", ctypes.c_size_t),
                 ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),

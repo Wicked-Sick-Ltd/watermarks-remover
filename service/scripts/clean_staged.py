@@ -91,6 +91,10 @@ def _clean_one(path: Path) -> tuple[str, str]:
     Returns ('changed' | 'unchanged' | 'skipped' | 'failed', detail).
     *detail* explains a 'failed' status and is empty for every other status.
     """
+    # Only for the report: clean_file.py --in-place is what refuses to read
+    # through a symlink, including one swapped in after this check.
+    if path.is_symlink():
+        return "failed", "refusing to clean through a symlink in place; it was left unchanged"
     try:
         if path.stat().st_size > MAX_INPUT_BYTES:
             eprint(f"skipping {path}: larger than {MAX_INPUT_BYTES} bytes")

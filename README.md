@@ -290,7 +290,7 @@ Optional system tools (auto-used when present — preinstalled in the core Docke
 
 | Tool | Role |
 | --- | --- |
-| [`c2patool`](https://github.com/contentauth/c2pa-rs/tree/main/cli) | Inspect C2PA manifests |
+| [`c2patool`](https://github.com/contentauth/c2pa-rs/tree/main/cli) | Inspect C2PA manifests (always run offline: remote-manifest, OCSP and other network lookups are disabled) |
 | [`exiftool`](https://exiftool.org/) | Residual metadata strip (esp. **PDF**) |
 | [`qpdf`](https://qpdf.sourceforge.io/) | Structural PDF rebuild — **required** for a real PDF strip (see below) |
 
@@ -373,6 +373,8 @@ The same machinery runs as a stdlib HTTP service (`service/scripts/server.py`) �
 
 Batch endpoints loop the same per-file pipeline as `/inspect`, `/detect`, `/clean`, and `/watermark`, capped at `WATERMARKS_MAX_BATCH_FILES` files per request (default 50). A malformed entry (bad base64, unknown option, unrecognized format) surfaces as that entry's `"ok": false` with an `"error"` string — it never aborts the rest of the batch.
 
+Each report's `findings`, `actions`, and `post_findings` list keeps at most `WATERMARKS_MAX_REPORT_ENTRIES` parser entries (default 200). A file that repeats a flagged chunk, segment, box, or tag more often ends that list with one `"no further entries listed: N omitted (report capped at 200)"` entry. Past the cap, the first finding of any confidence class not yet listed, and the first mutating action, are still kept, so audit verdicts do not change. The cleaner still drops every matching element, and verdict flags such as `has_c2pa` are unaffected.
+
 ```bash
 WM="http://127.0.0.1:8765"
 curl -s "$WM/health"                       # {"ok": true, "version": "..."}
@@ -381,7 +383,7 @@ curl -s -X POST "$WM/clean" -H 'Content-Type: application/json' \
   -d "{\"file\": \"$(base64 < notes.md | tr -d '\n')\", \"name\": \"notes.md\"}"
 ```
 
-The service routes by filename extension then magic bytes, so text / image / container are auto-detected. Set `WATERMARKS_SERVER_API_KEY` to require `Authorization: Bearer <key>` on every request. Loopback-only bind by default (`--host` to override); intended for a trusted network.
+The service routes by filename extension then magic bytes, so text / image / container are auto-detected. Set `WATERMARKS_SERVER_API_KEY` to require `Authorization: Bearer <key>` on every request; it is mandatory when `MARKLLM_DIR` is set (the service refuses to start, and refuses requests, without it). Loopback-only bind by default (`--host` to override); intended for a trusted network.
 
 ### Watermark detection (`/detect` and `detect_before` / `detect_after`)
 
@@ -508,6 +510,7 @@ set -a; . ./.env; set +a; python3 service/scripts/rewrite_text.py /tmp/x.txt -o 
 | `WATERMARKS_SYNTHID_TEXT_URL` | `wr-core` | Point core at the `wr-synthid-text` sidecar for SynthID text watermarking (e.g. `http://wr-synthid-text:8767` under the harness profile) |
 | `WATERMARKS_SYNTHID_TEXT_API_KEY` | `wr-core` + `wr-synthid-text` | Shared bearer key for the text watermark sidecar (empty = no auth) |
 | `WATERMARKS_SYNTHID_TEXT_TIMEOUT` | `wr-core` | Seconds to wait for the `wr-synthid-text` sidecar (default 120) |
+| `WATERMARKS_ALLOWED_TEXT_MODELS` | `wr-core` + `wr-synthid-text` | Comma-separated extra Hugging Face model ids a `/watermark` request may select via `options.model`; the default model (`facebook/opt-1.3b`, or the sidecar's `WATERMARKS_SYNTHID_TEXT_MODEL`) is always allowed and every other id is refused |
 | `WATERMARKS_MARKLLM_SCHEME` | `text_detectors.py` (host) | MarkLLM scheme for `/detect`: `kgw` (default) / `synthid` |
 | `HF_TOKEN` | harness/heavy services | Hugging Face token for gated models |
 | `WATERMARKS_SERVICE_URL` | client only (skill / curl) | Where to reach the service; default `http://127.0.0.1:8765` |
@@ -810,9 +813,11 @@ Hardening knobs:
   the Hugging Face cache only — zero network egress; fails fast if not cached.
   Custom remote code is never executed (transformers `trust_remote_code` is
   never enabled).
-- `WATERMARKS_MARKLLM_RLIMIT_AS=<bytes>` (env, POSIX) applies an address-space
-  limit to the MarkLLM detector subprocess. Off by default because torch/CUDA
-  usually needs large address spaces.
+- `WATERMARKS_MARKLLM_RLIMIT_AS=<bytes>` (env, POSIX) sets the address-space
+  limit of the MarkLLM detector subprocess (default 32 GiB; raise it if
+  torch/CUDA needs a larger address space). At most one detector subprocess
+  runs per process; concurrent detections wait for it until their
+  `WATERMARKS_MARKLLM_TIMEOUT` deadline.
 - Config files are capped at 1 MiB; the upstream checkout and the base image
   are pinned by SHA/digest.
 
@@ -1219,7 +1224,7 @@ repos:
       # - id: watermarks-remover-clean # opt-in: cleans staged files in place instead
 ```
 
-`watermarks-remover-check` fails the commit and lists findings; `watermarks-remover-clean` is opt-in and rewrites staged files in place (exits 1 so you review the diff and re-stage — the same convention as auto-fixing hooks like `ruff --fix`). When the cleaner cannot process a file at all — it crashed, was killed, or produced no report — `watermarks-remover-clean` names that file and exits 3 instead, so a cleaner that failed is never mistaken for an already-clean file. Run either by hand with `python3 service/scripts/check_staged.py <files...>` / `clean_staged.py <files...>`.
+`watermarks-remover-check` fails the commit and lists findings; `watermarks-remover-clean` is opt-in and rewrites staged files in place (exits 1 so you review the diff and re-stage — the same convention as auto-fixing hooks like `ruff --fix`). When the cleaner cannot process a file at all — it crashed, was killed, or produced no report — `watermarks-remover-clean` names that file and exits 3 instead, so a cleaner that failed is never mistaken for an already-clean file. `--in-place` never reads through a symlink or a file with other hard links, so the hook reports such a file the same way instead of writing a `.bak` of whatever it points at. Run either by hand with `python3 service/scripts/check_staged.py <files...>` / `clean_staged.py <files...>`.
 
 ## Tests
 
@@ -1337,6 +1342,7 @@ v0.7.0 brings the Layer B statistical-mark rewrite into the `/clean` service its
 
 ### Unreleased
 
+- **c2patool runs offline**: image and PDF inspection pass c2patool a settings file that disables remote-manifest fetching and OCSP and allows no network hosts, so an inspected file's XMP `dcterms:provenance` URL is reported, not requested.
 - **OOXML add-in metadata**: inspect Office web-extension vendor properties and references in DOCX, XLSX, and PPTX, then remove their package parts and dangling relationships; refuse cleaning while a matching Office owner file exists.
 - Pre-commit clean hook (`watermarks-remover-clean` / `clean_staged.py`): use content digests (`SHA-256`) and active action detection so clean files on disk are recognized without demanding infinite re-staging (#173)
 - **OOXML container preservation**: keep `<AppVersion>` intact in `docProps/app.xml` during DOCX, XLSX, and PPTX metadata cleaning to satisfy ECMA-376 schema constraints and avoid Microsoft Word/Office "unreadable content" errors (#283)
@@ -1368,7 +1374,7 @@ v0.7.0 brings the Layer B statistical-mark rewrite into the `/clean` service its
 - New optional harness (external `THU-BPM/MarkLLM` checkout, Apache-2.0): `detect_text_watermark.py` with `detect` / `watermark` subcommands for KGW and SynthID schemes
 - `rewrite_text.py --markllm-scheme` runs before/after detection around a Layer B rewrite and per-candidate detection when `--candidates N>1` (env-gated; reports `cleared`)
 - `setup_markllm.sh` bootstrap + `requirements-markllm.txt` (pinned deps) + `Dockerfile.markllm` and Makefile `bootstrap-markllm` / `smoke-markllm` / `docker-markllm-build` / `docker-markllm-help`
-- Hardening: `--offline` cache-only model loading (no HF egress, no remote code), 1 MiB config cap, optional `WATERMARKS_MARKLLM_RLIMIT_AS` on the rewrite subprocess, pinned torch in the Dockerfile, and clone-SHA verification in `Dockerfile.markllm`
+- Hardening: `--offline` cache-only model loading (no HF egress, no remote code), 1 MiB config cap, a default `WATERMARKS_MARKLLM_RLIMIT_AS` address-space cap on the MarkLLM detector subprocess, pinned torch in the Dockerfile, and clone-SHA verification in `Dockerfile.markllm`
 - Mock-based tests (`tests/test_markllm_detect.py`, 21 cases) — no torch in CI; verification-harness caveat (same-config-only, not a vendor-detector oracle) documented in README, SKILL.md, `removal-matrix.md`, `vendor-notes.md`
 
 **Fixes and polish**

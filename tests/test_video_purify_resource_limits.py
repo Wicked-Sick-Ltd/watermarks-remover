@@ -425,3 +425,52 @@ def test_cli_caps_extracted_frames(tmp_path, monkeypatch, frame_counter):
     )
     clean_video.main()
     _assert_frame_cap(frame_counter)
+
+
+@needs_ffmpeg
+def test_capped_extract_does_not_keep_the_full_soundtrack(tmp_path, monkeypatch):
+    """A successful purify past the frame cap must not keep the rest of the audio."""
+    src = tmp_path / "long.mp4"
+    subprocess.run(
+        [
+            FFMPEG,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=32x32:r=100",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=3",
+            "-frames:v",
+            str(BOMB_FRAMES),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(src),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    source_duration = _duration_seconds(src)
+    assert source_duration > 2
+
+    def _pass_through(_frame, _output, **_kwargs):
+        return {"available": True, "bytes_out": 1}
+
+    monkeypatch.setattr(clean_video, "run_ctrlregen_clean", _pass_through)
+    dest = tmp_path / "out.mp4"
+    result = clean_video.video_purify(
+        src,
+        dest,
+        remove_pixel="ctrlregen",
+        ctrlregen_dir=str(_backend_dir(tmp_path, "ctrlregen")),
+    )
+    assert result["available"] is True
+    assert result["frames_total"] <= MAX_EXTRACTED_FRAMES
+    assert _duration_seconds(dest) < source_duration - 1

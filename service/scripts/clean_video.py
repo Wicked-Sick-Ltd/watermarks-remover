@@ -15,7 +15,8 @@ performs no work -- it never silently returns a partially-purified video.
 
 One call writes at most ``MAX_EXTRACTED_FRAMES`` decoded frames. ``timeout``
 is a single budget for extraction, every selected frame, and remux, read from
-``time.monotonic``. It is not restarted for each frame.
+``time.monotonic``. It is not restarted for each frame. Copied audio ends with
+the frames that were actually written.
 """
 
 from __future__ import annotations
@@ -220,6 +221,38 @@ def _probe_fps(path: Path) -> float:
         return f if f > 0 else 25.0
     except Exception:  # take the default when ffprobe is missing or odd
         return 25.0
+
+
+def _stream_frame_count(path: Path) -> int | None:
+    """Container frame count, or None when the header does not carry one."""
+    ffprobe = which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        r = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=nb_frames",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                safe_arg(str(path)),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            preexec_fn=subprocess_preexec_fn,
+            creationflags=subprocess_creationflags,
+        )
+    except Exception:
+        return None
+    text = (r.stdout or "").strip()
+    return int(text) if text.isdigit() else None
 
 
 def _frame_durations(path: Path, frame_count: int) -> list[float]:
@@ -432,31 +465,36 @@ def video_purify(
             remux_timeout = budget_left()
             if remux_timeout is None:
                 return {"available": False, "error": "video purification exceeded the time budget"}
+            remux_cmd = [
+                ffmpeg,
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                safe_arg(str(frame_list)),
+                "-i",
+                safe_arg(str(input_path)),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0?",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "copy",
+            ]
+            source_frames = _stream_frame_count(input_path)
+            if source_frames is not None and source_frames > len(frames):
+                # The frame cap dropped the tail. End the copied audio with the
+                # frames that were written instead of keeping the full soundtrack.
+                remux_cmd.append("-shortest")
+            remux_cmd.extend([safe_arg(str(tmp_out)), "-nostdin"])
             rc, stderr = _run_ffmpeg(
-                [
-                    ffmpeg,
-                    "-y",
-                    "-f",
-                    "concat",
-                    "-safe",
-                    "0",
-                    "-i",
-                    safe_arg(str(frame_list)),
-                    "-i",
-                    safe_arg(str(input_path)),
-                    "-map",
-                    "0:v:0",
-                    "-map",
-                    "1:a:0?",
-                    "-c:v",
-                    "libx264",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-c:a",
-                    "copy",
-                    safe_arg(str(tmp_out)),
-                    "-nostdin",
-                ],
+                remux_cmd,
                 remux_timeout,
                 "ffmpeg remux",
             )

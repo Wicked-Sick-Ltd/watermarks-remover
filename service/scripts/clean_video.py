@@ -16,10 +16,13 @@ performs no work -- it never silently returns a partially-purified video.
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -38,6 +41,26 @@ _BACKEND_ENV = {
     "ctrlregen": ("NOAI_WATERMARK_DIR", "CtrlRegen"),
     "diffusion": ("MARKDIFFUSION_DIR", "DiffusionPurification"),
 }
+
+# Every frame becomes its own PNG on the temp disk and its own purifier run, so
+# a container that packs many small coded frames must be refused before it is
+# expanded. This bounds both the files written and the purifier calls made.
+# Frame sides are capped too, so each 8-bit RGB PNG has a bounded size.
+MAX_VIDEO_FRAMES = 64
+MAX_FRAME_SIDE = 4096
+_PROBE_TIMEOUT = 60
+
+
+class _Deadline:
+    """One wall-clock budget shared by every subprocess a purify run starts."""
+
+    def __init__(self, seconds: float) -> None:
+        self._end = time.monotonic() + seconds
+
+    def remaining(self, cap: int | None = None) -> int:
+        """Whole seconds left (0 once the budget is spent), optionally capped."""
+        left = max(0, math.floor(self._end - time.monotonic()))
+        return min(left, cap) if cap is not None else left
 
 
 def _ffmpeg_available() -> bool:
@@ -178,10 +201,61 @@ def _run_ffmpeg(cmd: list[str], timeout: int, what: str) -> tuple[int, str]:
     return r.returncode, r.stderr or ""
 
 
-def _probe_fps(path: Path) -> float:
+def _probe_video_stream(path: Path, *, decode: bool, timeout: int) -> dict[str, int] | None:
+    """Probe stream v:0 for its size and packet count (decoded frames with *decode*).
+
+    Packet counting only demuxes, so it is cheap on any input; decoded-frame
+    counting runs the decoder and should only follow a packet count under the cap.
+    Returns ``{"width", "height", "count"}``, or ``None`` when unavailable.
+    """
+    ffprobe = which("ffprobe")
+    if not ffprobe or timeout <= 0:
+        return None
+    flag, field = (
+        ("-count_frames", "nb_read_frames") if decode else ("-count_packets", "nb_read_packets")
+    )
+    try:
+        r = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                flag,
+                "-show_entries",
+                f"stream=width,height,{field}",
+                "-of",
+                "json",
+                safe_arg(str(path)),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            preexec_fn=subprocess_preexec_fn,
+            creationflags=subprocess_creationflags,
+        )
+    except Exception:  # timeout or spawn failure: the count is unknown
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        stream = json.loads(r.stdout or "{}")["streams"][0]
+        info = {
+            "width": int(stream["width"]),
+            "height": int(stream["height"]),
+            "count": int(stream[field]),
+        }
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    return info if min(info.values()) >= 0 else None
+
+
+def _probe_fps(path: Path, timeout: int = 30) -> float:
     """Probe the average source frame rate, falling back to a sane default."""
     ffprobe = which("ffprobe")
-    if not ffprobe:
+    if not ffprobe or timeout <= 0:
         return 25.0
     try:
         r = subprocess.run(
@@ -199,7 +273,7 @@ def _probe_fps(path: Path) -> float:
             ],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=timeout,
             check=False,
             preexec_fn=subprocess_preexec_fn,
             creationflags=subprocess_creationflags,
@@ -215,13 +289,13 @@ def _probe_fps(path: Path) -> float:
         return 25.0
 
 
-def _frame_durations(path: Path, frame_count: int) -> list[float]:
+def _frame_durations(path: Path, frame_count: int, timeout: int = 60) -> list[float]:
     """Per-frame presentation durations (seconds) from the source PTS.
 
     Returns an empty list when durations are unavailable, so the caller falls
     back to a constant frame rate rather than silently mangling the timing.
     """
-    if frame_count <= 0:
+    if frame_count <= 0 or timeout <= 0:
         return []
     ffprobe = which("ffprobe")
     if not ffprobe:
@@ -242,7 +316,7 @@ def _frame_durations(path: Path, frame_count: int) -> list[float]:
             ],
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=timeout,
             check=False,
             preexec_fn=subprocess_preexec_fn,
             creationflags=subprocess_creationflags,
@@ -307,7 +381,13 @@ def video_purify(
     Returns ``{"available": False, "error": ...}`` without side effects when the
     backend or ffmpeg is unavailable or a frame cannot be purified; a successful
     run returns ``{"available": True, ...}``.
+
+    *timeout* is the total budget in seconds for the whole run (probing,
+    extraction, every purified frame, and remux), not a per-step limit. Videos
+    with more than ``MAX_VIDEO_FRAMES`` frames are refused before any frame is
+    written.
     """
+    deadline = _Deadline(timeout)
     ok, err = _backend_configured(
         remove_pixel,
         explicit_dir=ctrlregen_dir if remove_pixel == "ctrlregen" else markdiffusion_dir,
@@ -328,19 +408,69 @@ def video_purify(
     ffmpeg = which("ffmpeg")
     assert ffmpeg is not None
 
+    def out_of_time(stage: str) -> dict[str, object]:
+        return {
+            "available": False,
+            "error": f"video purification exceeded its {timeout}s budget before {stage}",
+        }
+
+    # Packets first: demuxing alone cannot expand, so an oversized stream is
+    # refused before the decoder runs. Decoded frames are then counted too,
+    # because a decoder may emit more frames than packets.
+    for decode in (False, True):
+        probe_timeout = deadline.remaining(_PROBE_TIMEOUT)
+        if probe_timeout <= 0:
+            return out_of_time("frame counting")
+        info = _probe_video_stream(input_path, decode=decode, timeout=probe_timeout)
+        if info is None:
+            return {
+                "available": False,
+                "error": "could not count video frames (not a valid video?)",
+            }
+        if info["width"] > MAX_FRAME_SIDE or info["height"] > MAX_FRAME_SIDE:
+            return {
+                "available": False,
+                "error": (
+                    f"video is {info['width']}x{info['height']}; per-frame purification is "
+                    f"limited to {MAX_FRAME_SIDE}px per side"
+                ),
+            }
+        if info["count"] > MAX_VIDEO_FRAMES:
+            return {
+                "available": False,
+                "error": (
+                    f"video has {info['count']} frames; per-frame purification is limited to "
+                    f"{MAX_VIDEO_FRAMES}"
+                ),
+            }
+
     with tempfile.TemporaryDirectory(prefix="wm-video-") as _tmpdir:
         tmp = Path(_tmpdir)
         frames_dir = tmp / "frames"
         frames_dir.mkdir()
 
+        extract_timeout = deadline.remaining()
+        if extract_timeout <= 0:
+            return out_of_time("frame extraction")
         rc, stderr = _run_ffmpeg(
             [
                 ffmpeg,
                 "-y",
                 "-i",
                 safe_arg(str(input_path)),
+                "-map",
+                "0:v:0",  # the stream that was counted above
                 "-fps_mode",
                 "vfr",  # decode every frame (modern replacement for -vsync 0)
+                "-frames:v",
+                str(MAX_VIDEO_FRAMES),  # hard cap on files written, whatever the probe said
+                # Mid-stream resolution changes are not visible to the probe, so
+                # clamp every frame to the size cap here as well.
+                "-vf",
+                f"scale=w='min(iw,{MAX_FRAME_SIDE})':h='min(ih,{MAX_FRAME_SIDE})'"
+                ":force_original_aspect_ratio=decrease",
+                "-pix_fmt",
+                "rgb24",
                 "-start_number",
                 "0",
                 "-f",
@@ -348,7 +478,7 @@ def video_purify(
                 safe_arg(str(frames_dir / "frame_%06d.png")),
                 "-nostdin",
             ],
-            timeout,
+            extract_timeout,
             "ffmpeg frame extraction",
         )
         if rc != 0:
@@ -366,6 +496,9 @@ def video_purify(
         frames_purified = 0
         for idx in indices:
             frame = frames_dir / f"frame_{idx:06d}.png"
+            frame_timeout = deadline.remaining()
+            if frame_timeout <= 0:
+                return out_of_time(f"frame {idx} ({frames_purified}/{len(indices)} purified)")
             if remove_pixel == "ctrlregen":
                 res = run_ctrlregen_clean(
                     frame,
@@ -375,7 +508,7 @@ def video_purify(
                     steps=ctrlregen_steps,
                     device=ctrlregen_device,
                     seed=ctrlregen_seed,
-                    timeout=timeout,
+                    timeout=frame_timeout,
                 )
             else:
                 res = run_markdiffusion_purify(
@@ -387,7 +520,7 @@ def video_purify(
                     size=markdiffusion_size,
                     steps=markdiffusion_steps,
                     device=markdiffusion_device,
-                    timeout=timeout,
+                    timeout=frame_timeout,
                 )
             if not res.get("available"):
                 label = _BACKEND_LABELS[remove_pixel]
@@ -397,11 +530,16 @@ def video_purify(
                 }
             frames_purified += 1
 
-        durations = _frame_durations(input_path, len(frames))
+        durations = _frame_durations(
+            input_path, len(frames), timeout=deadline.remaining(_PROBE_TIMEOUT)
+        )
         if not durations:
-            durations = [1.0 / _probe_fps(input_path)] * len(frames)
+            durations = [1.0 / _probe_fps(input_path, timeout=deadline.remaining(30))] * len(frames)
         frame_list = _write_frame_list(frames_dir, durations)
 
+        remux_timeout = deadline.remaining()
+        if remux_timeout <= 0:
+            return out_of_time("remux")
         fd, tmp_out = tempfile.mkstemp(dir=output_path.parent, suffix=f".remux{output_path.suffix}")
         os.close(fd)
         try:
@@ -430,7 +568,7 @@ def video_purify(
                     safe_arg(str(tmp_out)),
                     "-nostdin",
                 ],
-                timeout,
+                remux_timeout,
                 "ffmpeg remux",
             )
             if rc != 0:

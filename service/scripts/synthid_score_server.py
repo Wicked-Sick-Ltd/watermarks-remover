@@ -138,7 +138,13 @@ class Handler(BaseHTTPRequestHandler):
         if code == 0 and payload is not None:
             self._respond(HTTPStatus.OK, payload)
         elif code == 2:
-            self._respond(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "could not load image"})
+            self._respond(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "ok": False,
+                    "error": "could not load image (unreadable, or over the decode pixel limit)",
+                },
+            )
         else:
             # exit 1 (runtime error) or 3 (unavailable) -> fail-soft payload,
             # matching the shape image_meta.run_synthid_score expects.

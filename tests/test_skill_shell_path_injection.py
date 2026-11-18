@@ -244,8 +244,10 @@ def test_quoted_parameter_expansion_is_not_shell_source() -> None:
         [
             "file_b64=$(base64 < \"$path\" | tr -d '\\n')",
             'name=$(basename "$path")',
-            'curl -s -X POST "${AUTH_HEADER[@]}" "$WM/inspect" '
-            "-H 'Content-Type: application/json' \\",
+            (
+                'curl -s -X POST "${AUTH_HEADER[@]}" "$WM/inspect" '
+                + "-H 'Content-Type: application/json' \\"
+            ),
             '  -d "{\\"file\\": \\"${file_b64}\\", \\"name\\": \\"${name}\\"}"',
         ]
     )

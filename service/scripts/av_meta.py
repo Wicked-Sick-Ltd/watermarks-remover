@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from common import classify_finding_confidence, safe_write_bytes
+from common import actions_list, classify_finding_confidence, findings_list, safe_write_bytes
 from image_meta import (
     AI_META_HINTS,
     XMP_UUID,  # noqa: F401 -- re-exported for callers that want the raw constant
@@ -101,7 +101,7 @@ def _classify_c2pa(hits: list[str]) -> bool:
 def _inspect_moov_udta(data: bytes) -> tuple[bool, bool, list[str]]:
     has_c2pa = False
     has_ai = False
-    findings: list[str] = []
+    findings = findings_list()
     for fourcc, payload, _size, _hdr in _parse_isobmff_boxes(data)[0]:
         if fourcc != b"moov":
             continue
@@ -118,7 +118,7 @@ def _inspect_moov_udta(data: bytes) -> tuple[bool, bool, list[str]]:
 
 
 def _strip_moov_udta(data: bytes, *, strip_all_metadata: bool) -> tuple[bytes, list[str], bool]:
-    actions: list[str] = []
+    actions = actions_list()
     out = bytearray()
     boxes, scanned_end = _parse_isobmff_boxes(data)
     for fourcc, payload, _size, hdr in boxes:
@@ -142,7 +142,12 @@ def _strip_moov_udta(data: bytes, *, strip_all_metadata: bool) -> tuple[bytes, l
 def _inspect_mp4(data: bytes) -> tuple[bool, bool, list[str]]:
     has_c2pa, has_ai, findings = inspect_isobmff(data, fmt="mp4")
     udta_c2pa, udta_ai, udta_findings = _inspect_moov_udta(data)
-    return has_c2pa or udta_c2pa, has_ai or udta_ai, findings + udta_findings
+    # `+` would concatenate two already-capped lists into a plain list and
+    # keep both omitted summaries. Folding applies the cap once.
+    merged = findings_list()
+    merged.extend_capped(findings)
+    merged.extend_capped(udta_findings)
+    return has_c2pa or udta_c2pa, has_ai or udta_ai, merged
 
 
 def _strip_mp4(data: bytes, *, strip_all_metadata: bool) -> tuple[bytes, list[str], bool]:
@@ -150,10 +155,19 @@ def _strip_mp4(data: bytes, *, strip_all_metadata: bool) -> tuple[bytes, list[st
     cleaned, udta_actions, inspection_incomplete = _strip_moov_udta(
         cleaned, strip_all_metadata=strip_all_metadata
     )
-    actions = [a for a in actions if not a.startswith("no MP4 metadata")] + udta_actions
-    if not actions:
-        actions = ["no MP4 metadata boxes removed (already clean or none matched)"]
-    return cleaned, actions, inspection_incomplete
+    merged = actions_list()
+    merged.extend_capped(actions)
+    # strip_isobmff's "already clean" notice is the whole list only when that
+    # walk removed nothing. Drop it before folding udta actions, and put it
+    # back only when udta removed nothing either.
+    if merged.omitted == 0 and all(
+        isinstance(item, str) and item.startswith("no MP4 metadata") for item in merged
+    ):
+        merged = actions_list()
+    merged.extend_capped(udta_actions)
+    if not merged:
+        merged.append("no MP4 metadata boxes removed (already clean or none matched)")
+    return cleaned, merged, inspection_incomplete
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +263,7 @@ def _inspect_id3v2(data: bytes) -> tuple[bool, bool, list[str]]:
     if parsed is None:
         return False, False, []
     total, major, frames = parsed
-    findings: list[str] = []
+    findings = findings_list()
     has_ai = False
     has_c2pa = False
 
@@ -330,7 +344,7 @@ def _strip_id3v2(data: bytes, *, strip_all_metadata: bool) -> tuple[bytes, list[
         return rest, [f"drop ID3v2.{major} tag ({total} bytes)"]
 
     kept = bytearray()
-    actions: list[str] = []
+    actions = actions_list()
     for frame_id, payload in frames:
         hits = _contains_any(payload, AI_META_HINTS)
         if hits:
@@ -396,7 +410,7 @@ def _strip_flac(data: bytes, *, strip_all_metadata: bool) -> tuple[bytes, list[s
         return rest, [f"drop FLAC ID3v2.{major} tag ({total} bytes)"]
 
     kept = bytearray()
-    actions: list[str] = []
+    actions = actions_list()
     pos = _id3v2_frames_start(data, total, major)
     if pos is None:
         return data, ["no FLAC C2PA metadata removed (invalid ID3v2 extended header)"]
@@ -424,7 +438,7 @@ def _strip_flac(data: bytes, *, strip_all_metadata: bool) -> tuple[bytes, list[s
 
 
 def _inspect_wav(data: bytes) -> tuple[bool, bool, list[str]]:
-    findings: list[str] = []
+    findings = findings_list()
     has_ai = False
     has_c2pa = False
     pos = 12  # past "RIFF" + size(4) + "WAVE"
@@ -457,7 +471,7 @@ def _inspect_wav(data: bytes) -> tuple[bool, bool, list[str]]:
 
 
 def _strip_wav(data: bytes, *, strip_all_metadata: bool) -> tuple[bytes, list[str]]:
-    actions: list[str] = []
+    actions = actions_list()
     out = bytearray(data[:12])
     pos = 12
     while pos + 8 <= len(data):

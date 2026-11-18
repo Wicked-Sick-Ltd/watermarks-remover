@@ -147,9 +147,18 @@ def test_markllm_ctor_available_with_override(monkeypatch, tmp_path):
     assert det.available() is True
 
 
-def test_markllm_preexec_default_off(monkeypatch):
+def test_markllm_preexec_default_on(monkeypatch):
+    if os.name != "posix":
+        pytest.skip("preexec_fn is POSIX-only")
     monkeypatch.delenv("WATERMARKS_MARKLLM_RLIMIT_AS", raising=False)
-    assert text_detectors._markllm_preexec() is None
+    assert callable(text_detectors._markllm_preexec())
+    assert text_detectors._markllm_rlimit_as() == text_detectors.DEFAULT_MARKLLM_RLIMIT_AS
+
+
+@pytest.mark.parametrize("raw", ["", "not-a-number", "0", "-1"])
+def test_markllm_rlimit_invalid_keeps_default(monkeypatch, raw):
+    monkeypatch.setenv("WATERMARKS_MARKLLM_RLIMIT_AS", raw)
+    assert text_detectors._markllm_rlimit_as() == text_detectors.DEFAULT_MARKLLM_RLIMIT_AS
 
 
 def test_markllm_preexec_env(monkeypatch):

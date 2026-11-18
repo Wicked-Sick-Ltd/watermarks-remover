@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
 import stat
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable, Hashable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,10 @@ from typing import Any
 # The env overrides remain as an explicit escape hatch.
 MAX_INPUT_BYTES = int(os.environ.get("WATERMARKS_MAX_INPUT_BYTES", str(256 << 20)))
 MAX_STDIN_BYTES = int(os.environ.get("WATERMARKS_MAX_STDIN_BYTES", str(64 << 20)))
+# Inspectors and strippers record one finding/action per flagged chunk,
+# segment, box or tag, and a file can repeat a 4-12 byte element millions of
+# times. Past this many entries a report only counts what it omitted.
+MAX_REPORT_ENTRIES = int(os.environ.get("WATERMARKS_MAX_REPORT_ENTRIES", "200"))
 
 # Exit codes shared by the audit CLIs. 0 = clean, 1 = actionable findings,
 # 2 = usage/refusal error, 3 = partial scan (some files/URLs failed to
@@ -29,6 +35,166 @@ EXIT_PARTIAL = 3
 # exhaust host memory or fill the disk.
 _CHILD_RLIMIT_AS = int(os.environ.get("WATERMARKS_CHILD_RLIMIT_AS", str(4 << 30)))
 _CHILD_RLIMIT_FSIZE = int(os.environ.get("WATERMARKS_CHILD_RLIMIT_FSIZE", str(2 << 30)))
+
+
+class ReportList(list):
+    """A findings/actions list holding at most ``cap`` ordinary entries.
+
+    Past the cap, an entry is still stored when ``key(entry)`` differs from
+    every stored entry's key, so whatever callers derive from the set of
+    keys (a finding's confidence class, whether an action mutated the file)
+    is unchanged; at most one extra entry per distinct key. Every other
+    entry is counted, not stored, in one trailing summary entry. The summary
+    starts with "no " so action filters read it as a non-change.
+    """
+
+    # Mutable, like list. Equality is explicit so the cap state below participates.
+    __hash__ = None
+
+    def __init__(
+        self,
+        iterable: Any = (),
+        *,
+        cap: int | None = None,
+        key: Callable[[Any], Hashable] | None = None,
+    ) -> None:
+        super().__init__()
+        self.cap = MAX_REPORT_ENTRIES if cap is None else max(0, cap)
+        self.key = key
+        self.omitted = 0
+        self._keys: set[Hashable] = set()
+        self._last: tuple[Any, Hashable] | None = None
+        self.extend(iterable)
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        # The default list-subclass reduce restores state before re-adding
+        # items through append(), which would re-count stored entries.
+        return (
+            _rebuild_report_list,
+            (list(self), self.cap, self.key, self.omitted, set(self._keys)),
+        )
+
+    def __eq__(self, other: object) -> bool:
+        # A plain list compares by contents only, so existing `entries == [...]`
+        # checks keep working. Another ReportList also compares the cap state
+        # that list equality would ignore. Anything else is left to the other
+        # operand.
+        if isinstance(other, ReportList):
+            # ``_last`` is only a lookup cache, so it is not part of equality.
+            return list.__eq__(self, other) is True and (
+                self.cap == other.cap
+                and self.key == other.key
+                and self.omitted == other.omitted
+                and self._keys == other._keys
+            )
+        if isinstance(other, list):
+            return list.__eq__(self, other) is True
+        return NotImplemented
+
+    def __ne__(self, other: object) -> bool:
+        # list.__ne__ only compares contents. Inverting __eq__ keeps != aligned
+        # with the cap state that __eq__ now includes.
+        equal = self.__eq__(other)
+        if equal is NotImplemented:
+            return NotImplemented
+        return not equal
+
+    def _summary(self) -> str:
+        return f"no further entries listed: {self.omitted} omitted (report capped at {self.cap})"
+
+    def _note_omitted(self, count: int) -> None:
+        if count <= 0:
+            return
+        had_summary = self.omitted > 0
+        self.omitted += count
+        summary = self._summary()
+        if had_summary:
+            self[-1] = summary
+        else:
+            super().append(summary)
+
+    def _key_of(self, item: Any) -> Hashable:
+        if self.key is None:
+            return None
+        if self._last is not None and self._last[0] == item:
+            return self._last[1]
+        k = self.key(item)
+        self._last = (item, k)
+        return k
+
+    def append(self, item: Any) -> None:
+        k = self._key_of(item)
+        if not self.omitted and len(self) < self.cap:
+            super().append(item)
+            self._keys.add(k)
+            return
+        if self.key is not None and k not in self._keys:
+            self._keys.add(k)
+            if self.omitted:
+                super().insert(len(self) - 1, item)
+            else:
+                super().append(item)
+            return
+        self._note_omitted(1)
+
+    def extend(self, iterable: Any) -> None:
+        for item in iterable:
+            self.append(item)
+
+    def __iadd__(self, iterable: Any) -> ReportList:
+        self.extend(iterable)
+        return self
+
+    def extend_capped(self, other: Any) -> None:
+        """Append *other* so two capped reports stay under this list's one cap.
+
+        ``left + right`` builds a plain list, so each side keeps its own
+        omitted summary and the cap applies twice. Stored entries are
+        appended (the other list's summary line is not) and its omitted
+        count is added to this one.
+        """
+        extra = 0
+        if isinstance(other, ReportList):
+            items = list(other)
+            extra = other.omitted
+            if extra and items:
+                items = items[:-1]
+        else:
+            items = list(other)
+        for item in items:
+            self.append(item)
+        self._note_omitted(extra)
+
+    def insert(self, index: Any, item: Any) -> None:
+        if not self.omitted and len(self) < self.cap:
+            super().insert(index, item)
+            self._keys.add(self._key_of(item))
+        else:
+            self.append(item)
+
+
+def _rebuild_report_list(
+    items: list[Any],
+    cap: int,
+    key: Callable[[Any], Hashable] | None,
+    omitted: int,
+    keys: set[Hashable],
+) -> ReportList:
+    rebuilt = ReportList(cap=cap, key=key)
+    list.extend(rebuilt, items)
+    rebuilt.omitted = omitted
+    rebuilt._keys = keys
+    return rebuilt
+
+
+def findings_list() -> ReportList:
+    """Capped findings list that keeps every confidence class it sees."""
+    return ReportList(key=classify_finding_confidence)
+
+
+def actions_list() -> ReportList:
+    """Capped actions list that keeps a mutating action if one occurs."""
+    return ReportList(key=is_mutating_action)
 
 
 def eprint(*args: object) -> None:
@@ -385,12 +551,99 @@ def result_has_changes(result: dict[str, Any]) -> bool:
     return any(is_mutating_action(a) for a in actions)
 
 
-def backup_path(src: Path) -> tuple[Path, bool]:
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def _open_in_place_source(path: str | Path) -> int:
+    """Open *path* read-only as the one file an in-place run may copy.
+
+    Refuses a final-component symlink, a non-regular file, and a file with
+    other hard links: any of them can name a file outside this directory, and
+    replacing a hard-linked file would leave its other names uncleaned anyway.
+    The returned descriptor is the bound file: read from it, never from the
+    name again, or a symlink swapped in afterwards redirects the read. The
+    entry is lstat'ed first and the opened file must be that same file;
+    ``O_NOFOLLOW`` makes the open itself refuse a symlink that replaced it in
+    between, and the identity check covers platforms without it (Windows).
+    """
+    before = os.lstat(path)
+    if stat.S_ISLNK(before.st_mode):
+        raise OSError(errno.ELOOP, "refusing to read through a symlink", str(path))
+    flags = (
+        os.O_RDONLY
+        | _O_NOFOLLOW
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        fd = os.open(path, flags)
+    except OSError as e:
+        # Linux and macOS report a refused symlink as ELOOP, FreeBSD as EMLINK.
+        if _O_NOFOLLOW and e.errno in (errno.ELOOP, errno.EMLINK):
+            raise OSError(errno.ELOOP, "refusing to read through a symlink", str(path)) from None
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", str(path))
+        if (st.st_dev, st.st_ino) != (before.st_dev, before.st_ino):
+            raise OSError(errno.EAGAIN, "file was replaced while it was opened", str(path))
+        if st.st_nlink > 1:
+            raise OSError(errno.EMLINK, f"it has {st.st_nlink} hard links", str(path))
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def read_in_place_source(path: str | Path, *, limit: int | None = None) -> bytes:
+    """The bytes an ``--in-place`` run cleans and backs up, read exactly once.
+
+    The source usually sits in a directory other users can write to (a
+    checkout, a download dir), so it is never followed to another file: that
+    would copy the other file into a ``.bak`` or into the cleaned file beside
+    it. Exits 2 when the source cannot be read that way, or is larger than
+    *limit* bytes.
+    """
+    try:
+        fd = _open_in_place_source(path)
+        with os.fdopen(fd, "rb") as f:
+            data = f.read() if limit is None else f.read(limit + 1)
+        if limit is not None and len(data) > limit:
+            raise OSError(errno.EFBIG, f"larger than {limit} bytes", str(path))
+        return data
+    except OSError as e:
+        eprint(f"refusing to clean {path} in place: {e.strerror or e}")
+        raise SystemExit(2) from None
+
+
+@contextlib.contextmanager
+def private_copy(data: bytes, name: str) -> Iterator[Path]:
+    """Yield a file called *name* holding *data*, inside a new 0700 temp directory.
+
+    In-place cleaners read this copy rather than the original or its ``.bak``:
+    either name can be swapped for a symlink after the source was read.
+    """
+    with tempfile.TemporaryDirectory(prefix="watermarks-in-place-") as tmp:
+        path = Path(tmp) / Path(name).name
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        yield path
+
+
+def backup_path(src: Path, data: bytes | None = None) -> tuple[Path, bool]:
     """Create a ``.bak`` copy of *src* no-clobber; return (backup, created).
 
     Used by ``--in-place`` flows so the original is never partially lost: the
     original file stays untouched until the cleaned output is atomically
     renamed over it.
+
+    *data* is the source as the caller already read it with
+    :func:`read_in_place_source`; pass it so the backup holds exactly the bytes
+    being cleaned. Without it the source is read here the same way, and a
+    symlink or non-regular source is refused before any file is created.
 
     A pre-existing ``.bak`` is preserved, not overwritten — the second run of
     an auto-fix hook (clean → commit-blocked → re-stage → clean again) used to
@@ -401,6 +654,8 @@ def backup_path(src: Path) -> tuple[Path, bool]:
     up possibly already-cleaned text. The returned tuple's second element
     reports whether this call created the backup or kept an existing one.
     """
+    if data is None:
+        data = read_in_place_source(src)
     bak = src.with_suffix(src.suffix + ".bak")
     if bak.exists() and not bak.is_file():
         eprint(f"cannot create backup {bak}: target exists and is not a regular file")
@@ -416,7 +671,7 @@ def backup_path(src: Path) -> tuple[Path, bool]:
         raise SystemExit(2) from None
     try:
         with os.fdopen(fd, "wb") as f:
-            f.write(src.read_bytes())
+            f.write(data)
             f.flush()
             os.fsync(f.fileno())
     except OSError as e:

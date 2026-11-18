@@ -48,7 +48,9 @@ import os
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import zlib
 from pathlib import Path
 
@@ -216,30 +218,7 @@ def _peak_rss_kib() -> int:
             raise RuntimeError(f"unexpected VmHWM unit: {line!r}")
         raise RuntimeError("VmHWM missing from /proc/self/status")
     if sys.platform == "win32":
-        # `import ctypes` does not load the wintypes submodule.
-        import ctypes.wintypes
-
-        class _Counters(ctypes.Structure):
-            _fields_ = [
-                ("cb", ctypes.wintypes.DWORD),
-                ("PageFaultCount", ctypes.wintypes.DWORD),
-                ("PeakWorkingSetSize", ctypes.c_size_t),
-                ("WorkingSetSize", ctypes.c_size_t),
-                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                ("PagefileUsage", ctypes.c_size_t),
-                ("PeakPagefileUsage", ctypes.c_size_t),
-            ]
-
-        counters = _Counters()
-        counters.cb = ctypes.sizeof(counters)
-        handle = ctypes.windll.kernel32.GetCurrentProcess()
-        ok = ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb)
-        if not ok:
-            raise OSError("GetProcessMemoryInfo failed")
-        return int(counters.PeakWorkingSetSize) // 1024
+        return _windows_peak_rss_kib()
     import resource
 
     raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
@@ -332,15 +311,56 @@ def baseline_fallback_unbounded() -> int:
     return 1 << 30
 
 
-def _start_sidecar(upstream: Path) -> subprocess.Popen[str]:
+def _windows_peak_rss_kib() -> int:
+    """Peak working set via kernel32, with a real 64-bit argument prototype.
+
+    ``ctypes.windll`` defaults to 32-bit argument slots. On 64-bit Windows that
+    truncates the process handle and the counter pointer, and the call fails.
+    """
+    import ctypes.wintypes
+
+    class _Counters(ctypes.Structure):
+        _fields_ = [
+            ("cb", ctypes.wintypes.DWORD),
+            ("PageFaultCount", ctypes.wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    current = kernel32.GetCurrentProcess
+    current.restype = ctypes.wintypes.HANDLE
+    query = kernel32.K32GetProcessMemoryInfo
+    query.argtypes = [
+        ctypes.wintypes.HANDLE,
+        ctypes.POINTER(_Counters),
+        ctypes.wintypes.DWORD,
+    ]
+    query.restype = ctypes.wintypes.BOOL
+    counters = _Counters()
+    counters.cb = ctypes.sizeof(counters)
+    if not query(current(), ctypes.byref(counters), counters.cb):
+        raise OSError(f"GetProcessMemoryInfo failed ({ctypes.get_last_error()})")
+    return int(counters.PeakWorkingSetSize) // 1024
+
+
+def _start_sidecar(upstream: Path) -> tuple[subprocess.Popen[str], Path]:
     """Start the sidecar and drain stderr on another thread.
 
-    A full stderr pipe blocks the child before it can print its port. Windows
-    and macOS fill that pipe sooner than Linux, so the reader has to start
-    before the first stdout line is expected.
+    The port is written to a file. A stdout pipe on macOS can swallow the
+    announcement, and a full stderr pipe can block the child before it writes.
     """
+    fd, name = tempfile.mkstemp(prefix="wm-sidecar-port-")
+    os.close(fd)
+    port_path = Path(name)
     proc = subprocess.Popen(
-        [sys.executable, "-u", str(THIS_FILE), "serve", str(upstream)],
+        [sys.executable, "-u", str(THIS_FILE), "serve", str(upstream), str(port_path)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         stdin=subprocess.DEVNULL,
@@ -357,7 +377,29 @@ def _start_sidecar(upstream: Path) -> subprocess.Popen[str]:
     drainer.start()
     proc._stderr_captured = captured  # type: ignore[attr-defined]
     proc._stderr_drainer = drainer  # type: ignore[attr-defined]
-    return proc
+    return proc, port_path
+
+
+def _wait_port(proc: subprocess.Popen[str], port_path: Path, timeout: float) -> int:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        text = ""
+        if port_path.is_file():
+            text = port_path.read_text(encoding="ascii", errors="replace").strip()
+        if text.isdigit():
+            return int(text)
+        if proc.poll() is not None:
+            break
+        time.sleep(0.05)
+    err = _captured_stderr(proc).strip()
+    marker = (
+        port_path.read_text(encoding="ascii", errors="replace").strip()
+        if port_path.is_file()
+        else ""
+    )
+    raise AssertionError(
+        f"sidecar produced no port (returncode={proc.poll()}) marker={marker!r} stderr={err[:500]!r}"
+    )
 
 
 def _captured_stderr(proc: subprocess.Popen[str]) -> str:
@@ -388,10 +430,9 @@ def _read_stdout_line(proc: subprocess.Popen[str], timeout: float) -> str:
 
 @contextlib.contextmanager
 def _sidecar(upstream: Path):
-    proc = _start_sidecar(upstream)
+    proc, port_path = _start_sidecar(upstream)
     try:
-        port_line = _read_stdout_line(proc, 30)
-        port = int(port_line.strip())
+        port = _wait_port(proc, port_path, 30)
         yield proc, port
     finally:
         if proc.poll() is None:
@@ -401,6 +442,7 @@ def _sidecar(upstream: Path):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=5)
+        port_path.unlink(missing_ok=True)
 
 
 def _post_sidecar(proc: subprocess.Popen[str], port: int, data: bytes) -> dict:
@@ -745,13 +787,18 @@ def _worker_score(image: str, upstream: str, *, cli: bool) -> int:
         with contextlib.redirect_stderr(stderr):
             code, payload = score_synthid.score_file(Path(image), upstream_dir=upstream)
         stdout.write(json.dumps(payload) if payload is not None else "")
+    try:
+        rss = _peak_rss_kib()
+    except OSError as exc:
+        stderr.write(f"\n{exc}\n")
+        rss = baseline_fallback_unbounded()
     json.dump(
         {
             "exit_code": code,
             "payload": json.loads(stdout.getvalue()) if stdout.getvalue().strip() else None,
             "stdout": stdout.getvalue(),
             "stderr": stderr.getvalue(),
-            "maxrss_kib": _peak_rss_kib(),
+            "maxrss_kib": rss,
         },
         sys.stdout,
     )
@@ -760,6 +807,9 @@ def _worker_score(image: str, upstream: str, *, cli: bool) -> int:
 
 
 def _worker_serve(upstream: str) -> int:
+    marker = Path(sys.argv[3]) if len(sys.argv) > 3 else None
+    if marker is not None:
+        marker.write_text("starting\n", encoding="ascii")
     os.environ["REVERSE_SYNTHID_DIR"] = upstream
     os.environ["WATERMARKS_SYNTHID_SCORER_API_KEY"] = ""
     sys.path.insert(0, str(SCRIPTS))
@@ -770,12 +820,19 @@ def _worker_serve(upstream: str) -> int:
     class _MeasuringHandler(sidecar.Handler):
         def do_POST(self) -> None:
             super().do_POST()
-            sys.stdout.write(f"RSS {_peak_rss_kib()}\n")
+            try:
+                rss = _peak_rss_kib()
+            except OSError as exc:
+                sys.stderr.write(f"{exc}\n")
+                sys.stderr.flush()
+                rss = baseline_fallback_unbounded()
+            sys.stdout.write(f"RSS {rss}\n")
             sys.stdout.flush()
 
     httpd = sidecar.ThreadingHTTPServer(("127.0.0.1", 0), _MeasuringHandler)
-    sys.stdout.write(f"{httpd.server_address[1]}\n")
-    sys.stdout.flush()
+    port = f"{httpd.server_address[1]}\n"
+    if marker is not None:
+        marker.write_text(port, encoding="ascii")
     httpd.serve_forever()
     return 0
 

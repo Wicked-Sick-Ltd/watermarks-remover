@@ -809,16 +809,25 @@ def _worker_score(image: str, upstream: str, *, cli: bool) -> int:
 
 
 def _worker_serve(upstream: str) -> int:
+    import socket
+
     marker = Path(sys.argv[3]) if len(sys.argv) > 3 else None
     rss_path = Path(sys.argv[4]) if len(sys.argv) > 4 else None
-    if marker is not None:
-        marker.write_text("starting\n", encoding="ascii")
+
+    def _mark(text: str) -> None:
+        if marker is not None:
+            marker.write_text(text + "\n", encoding="ascii")
+        sys.stderr.write(text + "\n")
+        sys.stderr.flush()
+
+    _mark("starting")
     os.environ["REVERSE_SYNTHID_DIR"] = upstream
     os.environ["WATERMARKS_SYNTHID_SCORER_API_KEY"] = ""
     sys.path.insert(0, str(SCRIPTS))
     import synthid_score_server as sidecar
 
     sidecar.API_KEY = ""
+    _mark("imported")
 
     class _MeasuringHandler(sidecar.Handler):
         def do_POST(self) -> None:
@@ -832,9 +841,19 @@ def _worker_serve(upstream: str) -> int:
             if rss_path is not None:
                 rss_path.write_text(f"RSS {rss}\n", encoding="ascii")
 
-    httpd = sidecar.ThreadingHTTPServer(("127.0.0.1", 0), _MeasuringHandler)
-    if marker is not None:
-        marker.write_text(f"{httpd.server_address[1]}\n", encoding="ascii")
+    class _Server(sidecar.ThreadingHTTPServer):
+        def server_bind(self) -> None:
+            # HTTPServer.server_bind calls socket.getfqdn, which blocks on
+            # macOS runners while reverse DNS for the loopback address waits.
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.socket.bind(self.server_address)
+            self.server_address = self.socket.getsockname()
+            _host, port = self.server_address[:2]
+            self.server_name = "127.0.0.1"
+            self.server_port = port
+
+    httpd = _Server(("127.0.0.1", 0), _MeasuringHandler)
+    _mark(str(httpd.server_address[1]))
     httpd.serve_forever()
     return 0
 

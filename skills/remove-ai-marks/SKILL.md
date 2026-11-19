@@ -114,15 +114,19 @@ and `/clean` returns 400 if a step's backend/model isn't configured).
 **Inspect first** (decide, don't guess):
 
 ```bash
+file_b64=$(base64 < "$path" | tr -d '\n')
+name=$(basename "$path")
 curl -s -X POST "${AUTH_HEADER[@]}" "$WM/inspect" -H 'Content-Type: application/json' \
-  -d "{\"file\": \"$(base64 < notes.md | tr -d '\n')\", \"name\": \"notes.md\"}"
+  -d "{\"file\": \"${file_b64}\", \"name\": \"${name}\"}"
 ```
 
 **Clean** (text / image / container are auto-detected by name + bytes):
 
 ```bash
+file_b64=$(base64 < "$path" | tr -d '\n')
+name=$(basename "$path")
 curl -s -X POST "${AUTH_HEADER[@]}" "$WM/clean" -H 'Content-Type: application/json' \
-  -d "{\"file\": \"$(base64 < notes.md | tr -d '\n')\", \"name\": \"notes.md\"}"
+  -d "{\"file\": \"${file_b64}\", \"name\": \"${name}\"}"
 ```
 
 Decode the returned `cleaned` base64 into the output file (`*.cleaned.*` by
@@ -154,8 +158,10 @@ mostly just send the file.
 ### 2. Inspect first
 
 ```bash
+file_b64=$(base64 < "$path" | tr -d '\n')
+name=$(basename "$path")
 curl -s -X POST "${AUTH_HEADER[@]}" "$WM/inspect" -H 'Content-Type: application/json' \
-  -d "{\"file\": \"$(base64 < path | tr -d '\n')\", \"name\": \"$(basename path)\"}"
+  -d "{\"file\": \"${file_b64}\", \"name\": \"${name}\"}"
 ```
 
 Show a short summary (suspicious codepoints; C2PA/AI flags; confidence labels
@@ -174,8 +180,10 @@ scorer (`scorers.synthid_http` / `scorers.synthid`), measure the result by
 detecting before and after cleaning:
 
 ```bash
+file_b64=$(base64 < "$path" | tr -d '\n')
+name=$(basename "$path")
 curl -s -X POST "${AUTH_HEADER[@]}" "$WM/detect" -H 'Content-Type: application/json' \
-  -d '{"file": "'"$(base64 < notes.txt | tr -d '\n')"'", "name": "notes.txt"}'
+  -d "{\"file\": \"${file_b64}\", \"name\": \"${name}\"}"
 ```
 
 Or fold detection into the clean: `/clean` with
@@ -190,8 +198,10 @@ the API in Aug 2026 — see `references/vendor-notes.md`.)
 **Any supported file (unified):**
 
 ```bash
+file_b64=$(base64 < "$path" | tr -d '\n')
+name=$(basename "$path")
 curl -s -X POST "${AUTH_HEADER[@]}" "$WM/clean" -H 'Content-Type: application/json' \
-  -d "{\"file\": \"$(base64 < INPUT | tr -d '\n')\", \"name\": \"$(basename INPUT)\"}"
+  -d "{\"file\": \"${file_b64}\", \"name\": \"${name}\"}"
 ```
 
 Decode `cleaned` → `OUTPUT` (`*.cleaned.*` unless the user asked in-place).
@@ -204,8 +214,10 @@ degraded (best-effort) result when either is missing — check `/capabilities`.
 says the backend is present:
 
 ```bash
+file_b64=$(base64 < "$path" | tr -d '\n')
+name=$(basename "$path")
 curl -s -X POST "${AUTH_HEADER[@]}" "$WM/clean" -H 'Content-Type: application/json' \
-  -d "{\"file\": \"$(base64 < shot.png | tr -d '\n')\", \"name\": \"shot.png\", \
+  -d "{\"file\": \"${file_b64}\", \"name\": \"${name}\", \
        \"options\": {\"remove_pixel\": \"ctrlregen\"}}"
 ```
 

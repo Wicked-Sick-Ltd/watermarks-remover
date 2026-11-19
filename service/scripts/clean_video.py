@@ -12,6 +12,11 @@ ffmpeg is a runtime dependency of the service image (installed in the
 Dockerfile); the purification backend is still an optional external GPU checkout.
 When ffmpeg or the backend is absent this reports ``available: False`` and
 performs no work -- it never silently returns a partially-purified video.
+
+One call writes at most ``MAX_EXTRACTED_FRAMES`` decoded frames. ``timeout``
+is a single budget for extraction, every selected frame, and remux, read from
+``time.monotonic``. It is not restarted for each frame. Copied audio ends with
+the frames that were actually written.
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -34,6 +40,8 @@ from common import (  # noqa: E402
 from image_meta import run_ctrlregen_clean, run_markdiffusion_purify  # noqa: E402
 
 _BACKEND_LABELS = {"ctrlregen": "CtrlRegen", "diffusion": "DiffusionPurification"}
+# A short, high-frame-count upload must not become one PNG per coded frame.
+MAX_EXTRACTED_FRAMES = 64
 _BACKEND_ENV = {
     "ctrlregen": ("NOAI_WATERMARK_DIR", "CtrlRegen"),
     "diffusion": ("MARKDIFFUSION_DIR", "DiffusionPurification"),
@@ -215,6 +223,38 @@ def _probe_fps(path: Path) -> float:
         return 25.0
 
 
+def _stream_frame_count(path: Path) -> int | None:
+    """Container frame count, or None when the header does not carry one."""
+    ffprobe = which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        r = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=nb_frames",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                safe_arg(str(path)),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            preexec_fn=subprocess_preexec_fn,
+            creationflags=subprocess_creationflags,
+        )
+    except Exception:
+        return None
+    text = (r.stdout or "").strip()
+    return int(text) if text.isdigit() else None
+
+
 def _frame_durations(path: Path, frame_count: int) -> list[float]:
     """Per-frame presentation durations (seconds) from the source PTS.
 
@@ -328,11 +368,23 @@ def video_purify(
     ffmpeg = which("ffmpeg")
     assert ffmpeg is not None
 
+    # One clock for extraction, every selected frame, and remux.
+    deadline = time.monotonic() + timeout
+
+    def budget_left() -> int | None:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return None
+        return max(1, int(left))
+
     with tempfile.TemporaryDirectory(prefix="wm-video-") as _tmpdir:
         tmp = Path(_tmpdir)
         frames_dir = tmp / "frames"
         frames_dir.mkdir()
 
+        extract_timeout = budget_left()
+        if extract_timeout is None:
+            return {"available": False, "error": "video purification exceeded the time budget"}
         rc, stderr = _run_ffmpeg(
             [
                 ffmpeg,
@@ -343,12 +395,14 @@ def video_purify(
                 "vfr",  # decode every frame (modern replacement for -vsync 0)
                 "-start_number",
                 "0",
+                "-frames:v",
+                str(MAX_EXTRACTED_FRAMES),
                 "-f",
                 "image2",
                 safe_arg(str(frames_dir / "frame_%06d.png")),
                 "-nostdin",
             ],
-            timeout,
+            extract_timeout,
             "ffmpeg frame extraction",
         )
         if rc != 0:
@@ -365,6 +419,9 @@ def video_purify(
 
         frames_purified = 0
         for idx in indices:
+            frame_timeout = budget_left()
+            if frame_timeout is None:
+                return {"available": False, "error": "video purification exceeded the time budget"}
             frame = frames_dir / f"frame_{idx:06d}.png"
             if remove_pixel == "ctrlregen":
                 res = run_ctrlregen_clean(
@@ -375,7 +432,7 @@ def video_purify(
                     steps=ctrlregen_steps,
                     device=ctrlregen_device,
                     seed=ctrlregen_seed,
-                    timeout=timeout,
+                    timeout=frame_timeout,
                 )
             else:
                 res = run_markdiffusion_purify(
@@ -387,7 +444,7 @@ def video_purify(
                     size=markdiffusion_size,
                     steps=markdiffusion_steps,
                     device=markdiffusion_device,
-                    timeout=timeout,
+                    timeout=frame_timeout,
                 )
             if not res.get("available"):
                 label = _BACKEND_LABELS[remove_pixel]
@@ -405,32 +462,40 @@ def video_purify(
         fd, tmp_out = tempfile.mkstemp(dir=output_path.parent, suffix=f".remux{output_path.suffix}")
         os.close(fd)
         try:
+            remux_timeout = budget_left()
+            if remux_timeout is None:
+                return {"available": False, "error": "video purification exceeded the time budget"}
+            remux_cmd = [
+                ffmpeg,
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                safe_arg(str(frame_list)),
+                "-i",
+                safe_arg(str(input_path)),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0?",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "copy",
+            ]
+            source_frames = _stream_frame_count(input_path)
+            if source_frames is not None and source_frames > len(frames):
+                # The frame cap dropped the tail. End the copied audio with the
+                # frames that were written instead of keeping the full soundtrack.
+                remux_cmd.append("-shortest")
+            remux_cmd.extend([safe_arg(str(tmp_out)), "-nostdin"])
             rc, stderr = _run_ffmpeg(
-                [
-                    ffmpeg,
-                    "-y",
-                    "-f",
-                    "concat",
-                    "-safe",
-                    "0",
-                    "-i",
-                    safe_arg(str(frame_list)),
-                    "-i",
-                    safe_arg(str(input_path)),
-                    "-map",
-                    "0:v:0",
-                    "-map",
-                    "1:a:0?",
-                    "-c:v",
-                    "libx264",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-c:a",
-                    "copy",
-                    safe_arg(str(tmp_out)),
-                    "-nostdin",
-                ],
-                timeout,
+                remux_cmd,
+                remux_timeout,
                 "ffmpeg remux",
             )
             if rc != 0:

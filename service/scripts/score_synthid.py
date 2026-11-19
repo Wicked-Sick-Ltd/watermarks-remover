@@ -9,8 +9,13 @@ scipy, PyWavelets, scikit-learn, Pillow).
 Exit codes:
   0  scored successfully
   1  scorer runtime error
-  2  bad input (missing/unreadable image, bad args)
+  2  bad input (missing/unreadable image, bad args, over decoded-size budget)
   3  scorer unavailable (not configured / missing deps / missing codebook)
+
+``cv2.imread`` (IMREAD_COLOR) allocates ``width * height * 3`` bytes, including
+for grayscale files. A header whose declared bitmap exceeds Pillow 13's
+decompression-bomb hard limit (twice ``Image.MAX_IMAGE_PIXELS``) is refused
+from the PNG IHDR or JPEG SOF before that decode, and before OpenCV is imported.
 
 The scoring logic lives in :func:score_file so the CLI and the HTTP
 sidecar (synthid_score_server.py) share one implementation.
@@ -25,6 +30,104 @@ import os
 import sys
 from pathlib import Path
 from typing import Any
+
+# Pillow 13 src/PIL/Image.py: DecompressionBombError above 2 * MAX_IMAGE_PIXELS.
+# MAX_IMAGE_PIXELS is 1024**3 // 4 // 3. cv2.imread's default flag is IMREAD_COLOR,
+# so the bitmap is 3 channels even when the container declares one.
+_DECODED_CHANNELS = 3
+_PILLOW_HARD_PIXEL_LIMIT = 2 * (1024 * 1024 * 1024 // 4 // 3)
+_JPEG_SOF = frozenset(
+    {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+)
+
+
+def _png_dimensions(path: Path) -> tuple[int, int] | None:
+    """Width and height from a PNG IHDR. Does not read the compressed image."""
+    with path.open("rb") as handle:
+        header = handle.read(24)
+    if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR":
+        return None
+    width = int.from_bytes(header[16:20], "big")
+    height = int.from_bytes(header[20:24], "big")
+    return width, height
+
+
+def _jpeg_dimensions(path: Path) -> tuple[int, int] | None:
+    """Width and height from the first JPEG SOF marker. Stops before entropy data.
+
+    Only a byte after ``0xFF`` is a marker. A stray non-FF byte is skipped, and
+    ``FF 00`` is a stuffed byte. Treating either as a length-prefixed segment
+    walks off the real SOF and the later decode still allocates the bitmap.
+    """
+    with path.open("rb") as handle:
+        if handle.read(2) != b"\xff\xd8":
+            return None
+        while True:
+            byte = handle.read(1)
+            if not byte:
+                return None
+            if byte != b"\xff":
+                continue
+            while True:
+                nxt = handle.read(1)
+                if not nxt:
+                    return None
+                if nxt != b"\xff":
+                    break
+            marker = nxt[0]
+            if marker == 0x00:
+                continue
+            if marker in (0xD9, 0xDA):
+                return None
+            if marker == 0x01 or 0xD0 <= marker <= 0xD8:
+                continue
+            length_bytes = handle.read(2)
+            if len(length_bytes) < 2:
+                return None
+            segment_length = int.from_bytes(length_bytes, "big")
+            if segment_length < 2:
+                return None
+            payload_length = segment_length - 2
+            if marker in _JPEG_SOF:
+                if payload_length < 5:
+                    return None
+                payload = handle.read(5)
+                if len(payload) < 5:
+                    return None
+                height = int.from_bytes(payload[1:3], "big")
+                width = int.from_bytes(payload[3:5], "big")
+                return width, height
+            handle.seek(payload_length, 1)
+
+
+def _refuse_over_decoded_budget(path: Path) -> bool:
+    """Print a pixel-budget refusal and return True when the header is too large.
+
+    The check uses the header alone. It does not decode, and it runs before
+    OpenCV is imported so a missing ``cv2`` cannot hide an over-budget image.
+    """
+    with path.open("rb") as handle:
+        sig = handle.read(8)
+    if sig == b"\x89PNG\r\n\x1a\n":
+        dims = _png_dimensions(path)
+    elif sig[:2] == b"\xff\xd8":
+        dims = _jpeg_dimensions(path)
+    else:
+        dims = None
+    if dims is None:
+        return False
+    width, height = dims
+    if width <= 0 or height <= 0:
+        return False
+    decoded = width * height * _DECODED_CHANNELS
+    if decoded <= _PILLOW_HARD_PIXEL_LIMIT:
+        return False
+    print(
+        f"image dimensions {width}x{height} exceed the decoded pixel budget "
+        f"({_DECODED_CHANNELS} channels, limit {_PILLOW_HARD_PIXEL_LIMIT} pixels)",
+        file=sys.stderr,
+    )
+    return True
 
 
 def resolve_upstream(raw: str | None) -> Path | None:
@@ -52,6 +155,9 @@ def score_file(
     """
     if not path.is_file():
         print(f"not a file: {path}", file=sys.stderr)
+        return 2, None
+
+    if _refuse_over_decoded_budget(path):
         return 2, None
 
     raw_upstream = upstream_dir or os.environ.get("REVERSE_SYNTHID_DIR")

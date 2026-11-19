@@ -7,6 +7,7 @@ Stdlib-first; PDF prefers optional exiftool/c2patool when present.
 import base64
 import bisect
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -3122,27 +3123,259 @@ def _epub_content_part(name: str) -> bool:
     )
 
 
-def _epub_encrypted_parts(data: bytes) -> set[str]:
-    """Return part names listed as encrypted in META-INF/encryption.xml (OCF)."""
-    try:
-        with zipfile.ZipFile(io.BytesIO(data)) as zf:
-            if "META-INF/encryption.xml" not in zf.namelist():
-                return set()
-            budget: list[int] = [0]
-            xml = _read_zip_member(zf, zf.getinfo("META-INF/encryption.xml"), budget).decode(
-                "utf-8", errors="replace"
-            )
-    except (zipfile.BadZipFile, KeyError):
-        return set()
+_EPUB_ENCRYPTION_MANIFEST = "META-INF/encryption.xml"
+
+# Font obfuscation XORs the head of a resource with a key derived from the
+# package's own identifier. A reading system undoes it with data in the book,
+# so the scanner can too; the value is how many leading bytes are XORed.
+_EPUB_OBFUSCATION_ALGORITHMS = {
+    "http://www.idpf.org/2008/embedding": 1040,
+    "http://ns.adobe.com/pdf/enc#RC": 1024,
+}
+_EPUB_FONT_RE = re.compile(r"\.(ttf|otf|woff2?)$", re.I)
+_EPUB_FONT_MAGIC = (b"\x00\x01\x00\x00", b"OTTO", b"true", b"typ1", b"ttcf", b"wOFF", b"wOF2")
+_EPUB_MARKUP_RE = re.compile(r"\.(xhtml|html?|opf|ncx|xml|svg|smil)$", re.I)
+
+# Gates read has_c2pa / has_ai_metadata and classify findings by their text,
+# so this wording is what makes an unread part fail them (see common.py).
+_EPUB_UNREAD_FINDING = "encrypted content not readable; scan inconclusive"
+
+
+@dataclass(frozen=True)
+class _EpubEncryption:
+    """What META-INF/encryption.xml claims, keyed by archive member name.
+
+    A listing is only a claim: it decides which parts *may* be opaque, never
+    which parts are skipped. ``list_all`` is set when a manifest exists but
+    could not be read, so every part is treated as possibly listed.
+    """
+
+    algorithms: dict[str, str] = field(default_factory=dict)
+    obfuscation_keys: dict[str, bytes] = field(default_factory=dict)
+    list_all: bool = False
+
+    def lists(self, name: str) -> bool:
+        return self.list_all or _epub_part_key(name) in self.algorithms
+
+    def algorithm(self, name: str) -> str:
+        return self.algorithms.get(_epub_part_key(name), "")
+
+
+def _epub_part_key(name: str) -> str:
+    """Compare part names the loosest way a reading system might.
+
+    A looser match only sends more parts through the readability check; a
+    stricter one would let ciphertext a reader still decrypts pass as an
+    unlisted part with nothing in it.
+    """
+    return posixpath.normpath(name.replace("\\", "/")).lstrip("/").casefold()
+
+
+def _xml_local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _epub_cipher_targets(uri: str) -> set[str]:
+    """Every part key (see _epub_part_key) a CipherReference URI might mean.
+
+    The URI is relative to META-INF/ per OCF, but producers are not
+    consistent, so accept every plausible normalization. Over-matching only
+    puts more parts through the readability check below.
+    """
     names: set[str] = set()
-    for uri in re.findall(r'CipherReference\s+URI="([^"]+)"', xml, re.I):
-        # The URI is relative to META-INF/ per OCF, but producers are not
-        # consistent, so accept every plausible normalization.
-        names.add(posixpath.normpath(posixpath.join("META-INF", uri)))
-        names.add(posixpath.normpath(uri))
-        if uri.startswith("../"):
-            names.add(posixpath.normpath(uri[3:]))
+    for form in {uri, urllib.parse.unquote(uri)}:
+        candidate = form.strip()
+        if not candidate:
+            continue
+        names.add(_epub_part_key(posixpath.join("META-INF", candidate)))
+        names.add(_epub_part_key(candidate))
+        if candidate.startswith("../"):
+            names.add(_epub_part_key(candidate[3:]))
     return names
+
+
+def _parse_epub_encryption_xml(raw: bytes) -> dict[str, str] | None:
+    """Map each CipherReference target to its EncryptionMethod algorithm.
+
+    The algorithm is '' when the entry names none. Returns None when the
+    manifest cannot be parsed, so the caller can fail closed.
+    """
+    # stdlib ET does not resolve external entities, but internal entity
+    # expansion is still possible, so DTDs are refused outright.
+    if b"<!DOCTYPE" in raw or b"<!ENTITY" in raw:
+        return None
+    try:
+        root = ET.fromstring(raw)  # noqa: S314 - DTD/entity declarations rejected above
+    except ET.ParseError:
+        return None
+
+    # Only a direct EncryptionMethod child of EncryptedData describes the data;
+    # one nested under KeyInfo describes a wrapped key.
+    method_of: dict[int, str] = {}
+    for enc in root.iter():
+        if _xml_local(enc.tag) != "EncryptedData":
+            continue
+        algorithm = ""
+        for child in enc:
+            if _xml_local(child.tag) == "EncryptionMethod":
+                algorithm = (child.get("Algorithm") or "").strip()
+        for child in enc:
+            if _xml_local(child.tag) != "CipherData":
+                continue
+            for ref in child:
+                if _xml_local(ref.tag) == "CipherReference":
+                    method_of[id(ref)] = algorithm
+
+    entries: dict[str, str] = {}
+    for ref in root.iter():
+        if _xml_local(ref.tag) != "CipherReference":
+            continue
+        uri = next((v for k, v in ref.attrib.items() if _xml_local(k).lower() == "uri"), "")
+        algorithm = method_of.get(id(ref), "")
+        for name in _epub_cipher_targets(uri):
+            # Two entries disagreeing on one part leave no method to rely on.
+            entries[name] = algorithm if entries.get(name, algorithm) == algorithm else ""
+    return entries
+
+
+def _epub_obfuscation_keys(zf: zipfile.ZipFile, budget: list[int]) -> dict[str, bytes]:
+    """Derive the font de-obfuscation keys from the package identifiers."""
+    try:
+        container = _read_zip_member(zf, zf.getinfo("META-INF/container.xml"), budget)
+        m = re.search(rb'full-path\s*=\s*["\']([^"\']+)["\']', container)
+        if not m:
+            return {}
+        opf_name = m.group(1).decode("utf-8", errors="replace")
+        opf = _read_zip_member(zf, zf.getinfo(opf_name), budget).decode("utf-8", errors="replace")
+    except (KeyError, *_ZIP_PARSE_ERRORS):
+        return {}
+
+    from xml.sax.saxutils import unescape
+
+    identifiers: dict[str, str] = {}
+    values: list[str] = []
+    for im in re.finditer(r"<(?:[\w.-]+:)?identifier\b([^>]*)>([^<]*)<", opf, re.I):
+        value = unescape(im.group(2))
+        values.append(value)
+        id_m = re.search(r"""\bid\s*=\s*["']([^"']*)["']""", im.group(1))
+        if id_m:
+            identifiers.setdefault(id_m.group(1), value)
+
+    keys: dict[str, bytes] = {}
+    uid_m = re.search(
+        r"""<(?:[\w.-]+:)?package\b[^>]*?\bunique-identifier\s*=\s*["']([^"']+)["']""", opf
+    )
+    if uid_m and uid_m.group(1) in identifiers:
+        stripped = re.sub(r"[\x20\x09\x0d\x0a]", "", identifiers[uid_m.group(1)])
+        keys["http://www.idpf.org/2008/embedding"] = hashlib.sha1(  # noqa: S324 - OCF-defined key derivation
+            stripped.encode("utf-8")
+        ).digest()
+    for value in values:
+        if value.strip().lower().startswith("urn:uuid:"):
+            hex_digits = re.sub(r"[^0-9a-fA-F]", "", value.strip()[9:])
+            if len(hex_digits) == 32:
+                keys["http://ns.adobe.com/pdf/enc#RC"] = bytes.fromhex(hex_digits)
+                break
+    return keys
+
+
+def _epub_encryption(data: bytes) -> _EpubEncryption:
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except _ZIP_PARSE_ERRORS:
+        return _EpubEncryption()
+    with zf:
+        manifest_key = _epub_part_key(_EPUB_ENCRYPTION_MANIFEST)
+        manifests = [i for i in zf.infolist() if _epub_part_key(i.filename) == manifest_key]
+        if not manifests:
+            return _EpubEncryption()
+        budget: list[int] = [0]
+        keys = _epub_obfuscation_keys(zf, budget)
+        algorithms: dict[str, str] = {}
+        for info in manifests:
+            try:
+                parsed = _parse_epub_encryption_xml(_read_zip_member(zf, info, budget))
+            except _ZIP_PARSE_ERRORS:
+                parsed = None
+            if parsed is None:
+                return _EpubEncryption(obfuscation_keys=keys, list_all=True)
+            for name, algorithm in parsed.items():
+                agreed = algorithms.get(name, algorithm) == algorithm
+                algorithms[name] = algorithm if agreed else ""
+    return _EpubEncryption(algorithms=algorithms, obfuscation_keys=keys)
+
+
+def _epub_readable_as_declared(name: str, raw: bytes) -> bool:
+    """True when *raw* reads as the content type the part's name declares."""
+    low = name.lower()
+    if _EPUB_FONT_RE.search(low):
+        return raw.startswith(_EPUB_FONT_MAGIC)
+    if _EPUB_MEDIA_RE.search(low) and not low.endswith(".svg"):
+        return detect_image_format(raw) != "unknown"
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    if "\x00" in text:
+        return False
+    if _EPUB_MARKUP_RE.search(low):
+        return text.lstrip("\ufeff \t\r\n").startswith("<")
+    return True
+
+
+def _epub_deobfuscate(raw: bytes, key: bytes, span: int) -> bytes:
+    head = bytes(b ^ key[i % len(key)] for i, b in enumerate(raw[:span]))
+    return head + raw[span:]
+
+
+def _epub_scan_views(enc: _EpubEncryption, name: str, raw: bytes) -> list[tuple[str, bytes]] | None:
+    """The byte views of one part to inspect, labelled for findings.
+
+    An unlisted part is just its bytes. A listed part is inspected whenever
+    its bytes read as its declared type, whatever the manifest claims; under
+    font obfuscation the de-obfuscated bytes a reading system renders are
+    inspected as well. None means no view is readable: the part is opaque and
+    the scan of it is inconclusive.
+    """
+    views = [(name, raw)]
+    if not enc.lists(name):
+        return views
+    algorithm = enc.algorithm(name)
+    span = _EPUB_OBFUSCATION_ALGORITHMS.get(algorithm)
+    key = enc.obfuscation_keys.get(algorithm)
+    if span and key:
+        views.append((f"{name} (de-obfuscated)", _epub_deobfuscate(raw, key, span)))
+    if any(_epub_readable_as_declared(name, view) for _, view in views):
+        return views
+    return None
+
+
+def _epub_copy_through(enc: _EpubEncryption, name: str, raw: bytes) -> bool:
+    """True when rewriting *raw* as its declared type would corrupt it."""
+    return enc.lists(name) and not _epub_readable_as_declared(name, raw)
+
+
+def _inspect_epub_part(name: str, label: str, raw: bytes) -> tuple[bool, bool, list[str]]:
+    low = name.lower()
+    findings: list[str] = []
+    if low.endswith((".xhtml", ".html", ".htm")):
+        text = raw.decode("utf-8", errors="surrogateescape")
+        c2, ai, sub, _ = inspect_html(text)
+        findings.extend(f"{label}: {f}" for f in sub)
+        return c2, ai, findings
+    has_c2pa = False
+    has_ai = False
+    if low.endswith(".opf"):
+        text = raw.decode("utf-8", errors="surrogateescape")
+        if AI_META_NAME_RE.search(text):
+            has_ai = True
+            findings.append(f"{label}: AI-ish metadata in package document")
+    c2, ai, hits = _blob_hits(raw)
+    if c2 or ai:
+        has_c2pa = has_c2pa or c2
+        has_ai = has_ai or ai
+        findings.append(f"{label}: {', '.join(hits[:6])}")
+    return has_c2pa, has_ai, findings
 
 
 def inspect_epub(data: bytes) -> tuple[bool, bool, list[str], dict]:
@@ -3150,44 +3383,33 @@ def inspect_epub(data: bytes) -> tuple[bool, bool, list[str], dict]:
     has_c2pa = False
     has_ai = False
     budget = [0]
-    encrypted = _epub_encrypted_parts(data)
+    enc = _epub_encryption(data)
     names: list[str] = []
+    unread = 0
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             names = zf.namelist()
             for info in zf.infolist():
                 _check_zip_budget(info, budget)
                 name = info.filename
-                if name in encrypted:
-                    findings.append(f"{name}: encrypted content (skipped)")
-                    continue
                 raw = _read_zip_member(zf, info, budget)
-                if name.lower().endswith((".xhtml", ".html", ".htm")):
-                    text = raw.decode("utf-8", errors="surrogateescape")
-                    c2, ai, sub, _ = inspect_html(text)
-                    if c2:
-                        has_c2pa = True
-                    if ai:
-                        has_ai = True
-                    for f in sub:
-                        findings.append(f"{name}: {f}")
-                    continue
-                if name.lower().endswith(".opf"):
-                    text = raw.decode("utf-8", errors="surrogateescape")
-                    if AI_META_NAME_RE.search(text):
-                        has_ai = True
-                        findings.append(f"{name}: AI-ish metadata in package document")
+                views = _epub_scan_views(enc, name, raw)
+                if views is None:
+                    # Nothing here could be read, so nothing here is cleared:
+                    # the part counts against the file until it can be.
+                    unread += 1
+                    has_ai = True
+                    findings.append(f"{name}: {_EPUB_UNREAD_FINDING}")
                     c2, ai, hits = _blob_hits(raw)
                     if c2 or ai:
                         has_c2pa = has_c2pa or c2
-                        has_ai = has_ai or ai
                         findings.append(f"{name}: {', '.join(hits[:6])}")
                     continue
-                c2, ai, hits = _blob_hits(raw)
-                if c2 or ai:
+                for label, view in views:
+                    c2, ai, sub = _inspect_epub_part(name, label, view)
                     has_c2pa = has_c2pa or c2
                     has_ai = has_ai or ai
-                    findings.append(f"{name}: {', '.join(hits[:6])}")
+                    findings.extend(sub)
     except _ZIP_PARSE_ERRORS as exc:
         # EPUB previously caught only BadZipFile, so a zlib error propagated
         # (crashing the scan) while a CRC failure discarded everything —
@@ -3200,7 +3422,10 @@ def inspect_epub(data: bytes) -> tuple[bool, bool, list[str], dict]:
             )
             return has_c2pa, has_ai or has_c2pa, findings, {"parts": len(names)}
         return False, False, ["not a valid EPUB zip"], {}
-    return has_c2pa, has_ai or has_c2pa, findings, {"parts": len(names)}
+    details: dict[str, Any] = {"parts": len(names)}
+    if unread:
+        details["unread_parts"] = unread
+    return has_c2pa, has_ai or has_c2pa, findings, details
 
 
 # Open/close tag halves for the linear OPF scans in _scrub_epub_opf.
@@ -3284,11 +3509,13 @@ def clean_epub(
 
     Embedded raster/SVG media get their own metadata stripped; structural and
     OCF control parts (mimetype, container.xml, encryption.xml, relationships,
-    fonts) are kept so the book stays readable. Parts listed in
-    META-INF/encryption.xml are copied verbatim — their bytes are ciphertext,
-    so any rewrite would corrupt them. Non-content parts carrying AI/C2PA
-    markers are dropped, and the OPF manifest is pruned afterwards so no
-    dropped part stays referenced.
+    fonts) are kept so the book stays readable. A part listed in
+    META-INF/encryption.xml is copied verbatim only when its bytes do not read
+    as its declared type, since a rewrite would corrupt ciphertext; a listed
+    part stored in the clear is cleaned like any other, and the post-clean
+    inspection reports any part it still cannot read as unread. Non-content
+    parts carrying AI/C2PA markers are dropped, and the OPF manifest is pruned
+    afterwards so no dropped part stays referenced.
     """
     from text_unicode import clean_text  # local import to avoid cycles
 
@@ -3296,7 +3523,7 @@ def clean_epub(
     budget = [0]
     layer_removed = 0
     layer_replaced = 0
-    encrypted = _epub_encrypted_parts(data)
+    enc = _epub_encryption(data)
     kept: list[tuple[zipfile.ZipInfo, bytes]] = []
     dropped: set[str] = set()
     with zipfile.ZipFile(io.BytesIO(data)) as zin:
@@ -3306,8 +3533,7 @@ def clean_epub(
             raw = _read_zip_member(zin, info, budget)
             low = name.lower()
 
-            # Encrypted parts are opaque ciphertext: pass through untouched.
-            if name in encrypted:
+            if _epub_copy_through(enc, name, raw):
                 kept.append((info, raw))
                 continue
 
@@ -4658,24 +4884,23 @@ def inspect_container(
     elif fmt == "epub":
         from text_unicode import inspect_text  # local import to avoid cycles
 
-        encrypted = _epub_encrypted_parts(data)
+        enc = _epub_encryption(data)
         budget: list[int] = [0]
         try:
             with zipfile.ZipFile(io.BytesIO(data)) as zf:
                 for info in zf.infolist():
-                    if info.filename in encrypted:
+                    if not info.filename.lower().endswith((".xhtml", ".html", ".htm")):
                         continue
-                    if info.filename.lower().endswith((".xhtml", ".html", ".htm")):
-                        ta = inspect_text(
-                            _read_zip_member(zf, info, budget).decode(
-                                "utf-8", errors="surrogateescape"
-                            )
-                        ).to_dict()
+                    raw = _read_zip_member(zf, info, budget)
+                    # An unreadable part was already reported as unread by
+                    # inspect_epub; its bytes carry no text to count.
+                    for label, view in _epub_scan_views(enc, info.filename, raw) or ():
+                        ta = inspect_text(view.decode("utf-8", errors="surrogateescape")).to_dict()
                         layer_a_total += ta["suspicious_total"]
                         for h in ta["hits"]:
                             layer_a_hits.append(h)
                             findings.append(
-                                f"layer-a ({info.filename}): {h['codepoint']} {h['label']} "
+                                f"layer-a ({label}): {h['codepoint']} {h['label']} "
                                 f"x{h['count']} ({h['kind']})"
                             )
         except zipfile.BadZipFile:

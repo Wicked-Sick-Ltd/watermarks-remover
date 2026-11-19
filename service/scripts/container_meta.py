@@ -3909,10 +3909,17 @@ _GHOSTSCRIPT_TIMEOUT = 300.0
 
 
 class _Deadline:
-    """What is left of a shared budget, clamped to each tool's own ceiling."""
+    """What is left of a shared budget, clamped to each tool's own ceiling.
+
+    Besides wall clock it carries the embedded-file allowance: how many more
+    attachments may be extracted and how many bytes they may write. Nested
+    containers spend the same object, so one request has one allowance.
+    """
 
     def __init__(self, budget: float) -> None:
         self._end = time.monotonic() + budget
+        self.attachments_left = MAX_ATTACHMENT_COUNT
+        self.attachment_bytes_left = MAX_ATTACHMENT_TOTAL_BYTES
 
     def remaining(self) -> float:
         return max(0.0, self._end - time.monotonic())
@@ -3921,8 +3928,9 @@ class _Deadline:
         return self.remaining() <= 0.0
 
     def timeout(self, cap: float) -> float:
-        # Never hand subprocess 0: it would raise instead of running.
-        return max(1.0, min(cap, self.remaining()))
+        # Callers check spent() before starting a child. A floor here would
+        # hand every child time the budget no longer has.
+        return min(cap, self.remaining())
 
 
 _GHOSTSCRIPT_NAMES = ("gs", "gswin64c", "gswin32c")
@@ -4074,7 +4082,16 @@ CLEAN_ATTACHMENT_MODES = frozenset({"auto", "always", "never"})
 DEFAULT_CLEAN_ATTACHMENTS = "always"
 MAX_ATTACHMENT_DEPTH = 3
 MAX_ATTACHMENT_BYTES = 64 * 1024 * 1024
+# Per clean or inspect, nested containers included. A name tree can list
+# thousands of files that all point at one small compressed stream, so neither
+# the upload size nor the per-file cap bounds the extraction work.
+MAX_ATTACHMENT_COUNT = 256
+MAX_ATTACHMENT_TOTAL_BYTES = 256 * 1024 * 1024
 _QPDF_ATTACH_TIMEOUT = 60.0
+
+
+class _AttachmentBudgetSpent(Exception):
+    """Raised before starting qpdf when the shared attachment allowance is gone."""
 
 
 def _pdf_iso_to_pdf_date(iso: str | None) -> str | None:
@@ -4104,18 +4121,41 @@ def _pdf_iso_to_pdf_date(iso: str | None) -> str | None:
     return f"D:{y}{mo}{d}{h}{mi}{s}{sign}{oh}'{om}'"
 
 
-def _pdf_attachment_list(path: Path, deadline: "_Deadline | None" = None) -> list[dict]:
+# ``listed`` when the attachment index did not finish. Distinct from 0, which
+# means qpdf listed the file and it has no embedded files. A near-zero
+# ``timeout()`` makes ``subprocess.run`` raise ``TimeoutExpired`` before qpdf
+# can answer; that must not look like an empty name tree.
+_ATTACHMENT_LIST_INCOMPLETE = -1
+
+
+def _pdf_attachment_list(
+    path: Path, deadline: "_Deadline | None" = None, limit: int | None = None
+) -> list[dict]:
     """Enumerate a PDF's embedded files via ``qpdf --json``.
 
     Returns a list of ``{key, name, mimetype, description, creationdate,
-    modificationdate}`` in PDF order. Empty when qpdf is absent, the budget is
-    spent, or the PDF carries no attachments.
+    modificationdate}`` in PDF order, at most *limit* long. Empty when qpdf is
+    absent, the listing did not finish, or the PDF carries no attachments.
+    Callers that have to tell those apart must use ``_pdf_attachment_index``.
+    """
+    return _pdf_attachment_index(path, deadline, limit)[0]
+
+
+def _pdf_attachment_index(
+    path: Path, deadline: "_Deadline | None", limit: int | None
+) -> tuple[list[dict], int]:
+    """``(first *limit* attachments, how many the PDF lists in total)``.
+
+    The count is ``_ATTACHMENT_LIST_INCOMPLETE`` when the budget was already
+    spent or qpdf timed out, including a not-yet-spent deadline whose
+    ``timeout()`` is too small for the process to finish. That is not an
+    empty listing.
     """
     qpdf = which("qpdf")
     if not qpdf:
-        return []
+        return [], 0
     if deadline is not None and deadline.spent():
-        return []
+        return [], _ATTACHMENT_LIST_INCOMPLETE
     try:
         r = subprocess.run(
             [qpdf, "--json", "--json-key=attachments", "--", safe_arg(str(path))],
@@ -4128,16 +4168,23 @@ def _pdf_attachment_list(path: Path, deadline: "_Deadline | None" = None) -> lis
             preexec_fn=subprocess_preexec_fn,
             creationflags=subprocess_creationflags,
         )
+    except subprocess.TimeoutExpired:
+        return [], _ATTACHMENT_LIST_INCOMPLETE
     except Exception:
-        return []
+        return [], 0
     if r.returncode != 0:
-        return []
+        return [], 0
     try:
         payload = json.loads(r.stdout)
     except Exception:
-        return []
+        return [], 0
+    listed = payload.get("attachments") or {}
+    if not isinstance(listed, dict):
+        return [], 0
     out: list[dict] = []
-    for key, info in (payload.get("attachments") or {}).items():
+    for key, info in listed.items():
+        if limit is not None and len(out) >= limit:
+            break
         if not isinstance(info, dict):
             continue
         names = info.get("names") or {}
@@ -4155,7 +4202,7 @@ def _pdf_attachment_list(path: Path, deadline: "_Deadline | None" = None) -> lis
                 "named_UF": names.get("/UF"),
             }
         )
-    return out
+    return out, sum(isinstance(info, dict) for info in listed.values())
 
 
 def _watchdog_kill(process: "subprocess.Popen[bytes]", seconds: float) -> threading.Event:
@@ -4176,21 +4223,57 @@ def _watchdog_kill(process: "subprocess.Popen[bytes]", seconds: float) -> thread
     return stop
 
 
-def _pdf_show_attachment(path: Path, key: str, tmp: Path, deadline: "_Deadline | None") -> int:
-    """Extract one embedded file to *tmp*, bounding the write to the size cap.
+def _pdf_take_attachment(
+    path: Path, key: str, tmp: Path, deadline: "_Deadline"
+) -> tuple[int, str | None]:
+    """Extract one embedded file to *tmp*, charging it to the shared allowance.
 
-    Returns the byte count on success (``<= MAX_ATTACHMENT_BYTES``),
-    ``MAX_ATTACHMENT_BYTES + 1`` when the attachment exceeds the cap (the
-    subprocess is terminated and *tmp* is left partial), or ``-1`` on failure.
-    qpdf's output is consumed in bounded chunks so an embedded stream that
-    expands well past the cap is not written to disk in full before being
-    rejected, and a watchdog enforces the deadline/``_QPDF_ATTACH_TIMEOUT`` even
-    when qpdf stops producing output.
+    Raises ``_AttachmentBudgetSpent`` without starting qpdf once the clock, the
+    file count or the byte allowance is used up. Otherwise returns
+    ``(bytes, None)``, or ``(-1, reason)`` with nothing left at *tmp*.
+    """
+    if deadline.spent():
+        raise _AttachmentBudgetSpent("clean budget exhausted")
+    if deadline.attachments_left <= 0:
+        raise _AttachmentBudgetSpent("attachment count cap reached")
+    if deadline.attachment_bytes_left <= 0:
+        raise _AttachmentBudgetSpent("attachment byte budget exhausted")
+    deadline.attachments_left -= 1
+    limit = min(MAX_ATTACHMENT_BYTES, deadline.attachment_bytes_left)
+    n = _pdf_show_attachment(path, key, tmp, deadline, limit=limit)
+    deadline.attachment_bytes_left -= tmp.stat().st_size if tmp.is_file() else 0
+    if 0 <= n <= limit:
+        return n, None
+    tmp.unlink(missing_ok=True)
+    if n < 0:
+        return -1, "extract failed"
+    if limit < MAX_ATTACHMENT_BYTES:
+        deadline.attachment_bytes_left = 0
+        return -1, "attachment byte budget exhausted"
+    return -1, "attachment too large"
+
+
+def _pdf_show_attachment(
+    path: Path,
+    key: str,
+    tmp: Path,
+    deadline: "_Deadline | None",
+    limit: int = MAX_ATTACHMENT_BYTES,
+) -> int:
+    """Extract one embedded file to *tmp*, bounding the write to *limit*.
+
+    Returns the byte count on success (``<= limit``), ``limit + 1`` when the
+    attachment exceeds it (the subprocess is terminated and *tmp* is left
+    partial), or ``-1`` on failure. qpdf's output is consumed in bounded chunks
+    so an embedded stream that expands well past the cap is not written to disk
+    in full before being rejected, and a watchdog enforces the
+    deadline/``_QPDF_ATTACH_TIMEOUT`` even when qpdf stops producing output.
     """
     qpdf = which("qpdf")
     if not qpdf:
         return -1
-    limit = MAX_ATTACHMENT_BYTES
+    if deadline is not None and deadline.spent():
+        return -1
     total = 0
     timeout = _QPDF_ATTACH_TIMEOUT if deadline is None else deadline.timeout(_QPDF_ATTACH_TIMEOUT)
     try:
@@ -4267,28 +4350,34 @@ def _pdf_inspect_attachments(
     """
     if depth > MAX_ATTACHMENT_DEPTH:
         return [], True
-    if deadline is not None and deadline.spent():
+    if deadline is None:
+        deadline = _Deadline(PDF_CLEAN_BUDGET_SECONDS)
+    if deadline.spent():
         return [], True
-    attachments = _pdf_attachment_list(path, deadline)
+    attachments, listed = _pdf_attachment_index(path, deadline, deadline.attachments_left)
+    if listed < 0:
+        return [], True
     results: list[dict] = []
-    truncated = False
+    truncated = listed > len(attachments)
     with tempfile.TemporaryDirectory(prefix="wr-att-insp-") as staging:
         for i, att in enumerate(attachments):
             # Sanitise the temp name: keep the suffix so classification works,
             # drop any directory separators in the attachment's own name.
             safe_name = Path(att["name"]).name or f"att-{i}"
             tmp = confined_path(staging, f"att-{i}{_attachment_suffix(safe_name)}")
-            n = _pdf_show_attachment(path, att["key"], tmp, deadline)
-            if n < 0:
-                results.append({**att, "kind": "unknown", "error": "extract failed"})
-                continue
-            if n > MAX_ATTACHMENT_BYTES:
-                results.append({**att, "kind": "unknown", "error": "attachment too large"})
+            try:
+                _n, error = _pdf_take_attachment(path, att["key"], tmp, deadline)
+            except _AttachmentBudgetSpent:
                 truncated = True
+                break
+            if error:
+                results.append({**att, "kind": "unknown", "error": error})
+                truncated = truncated or error != "extract failed"
                 continue
             data = tmp.read_bytes()
             kind = _classify_attachment(att["name"], data)
             has_c2pa, has_ai, findings = _inspect_attachment_bytes(tmp, data, kind, depth, deadline)
+            tmp.unlink(missing_ok=True)
             results.append(
                 {
                     **att,
@@ -4298,7 +4387,7 @@ def _pdf_inspect_attachments(
                     "findings": findings,
                 }
             )
-            if deadline is not None and deadline.spent():
+            if deadline.spent():
                 truncated = True
                 break
     return results, truncated
@@ -4333,32 +4422,47 @@ def _inspect_attachment_bytes(
 
 
 def _pdf_extract_attachments(
-    path: Path, deadline: "_Deadline | None", staging: Path
-) -> tuple[list[dict], list[dict]]:
-    """Extract every embedded file into *staging*.
+    path: Path, deadline: "_Deadline", staging: Path, actions: list[str]
+) -> tuple[list[dict], list[dict], bool]:
+    """Extract embedded files into *staging*, within the shared allowance.
 
-    Returns ``(ok, skipped)``: ``ok`` entries carry ``in_path``; ``skipped``
-    entries carry an ``error`` (extract failed / over size cap) so the clean
-    pass can report what it could not touch rather than dropping it silently.
+    Returns ``(ok, skipped, truncated)``: ``ok`` entries carry ``in_path``;
+    ``skipped`` entries carry an ``error`` (extract failed / over size cap) so
+    the clean pass can report what it could not touch rather than dropping it
+    silently. ``truncated`` is true when the count cap, byte allowance or clock
+    ended the walk early; the files never reached are counted in *actions*.
     Used up front in ``clean_pdf`` so attachment bytes are preserved even when
     the Ghostscript deep-image pass — which re-distills the page and drops
     embedded files — runs later.
     """
-    attachments = _pdf_attachment_list(path, deadline)
+    attachments, listed = _pdf_attachment_index(path, deadline, deadline.attachments_left)
+    if listed < 0:
+        actions.append("warning: embedded-file list did not finish (clean budget)")
+        return [], [], True
     ok: list[dict] = []
     skipped: list[dict] = []
+    if listed > len(attachments):
+        actions.append(
+            f"warning: {listed - len(attachments)} embedded file(s) beyond the "
+            f"attachment count cap ({MAX_ATTACHMENT_COUNT}) left unprocessed"
+        )
+    truncated = listed > len(attachments)
     for i, att in enumerate(attachments):
         safe_name = Path(att["name"]).name or f"att-{i}"
         in_path = confined_path(staging, f"{i}-in{_attachment_suffix(safe_name)}")
-        n = _pdf_show_attachment(path, att["key"], in_path, deadline)
-        if n < 0:
-            skipped.append({**att, "error": "extract failed"})
-            continue
-        if n > MAX_ATTACHMENT_BYTES:
-            skipped.append({**att, "error": "attachment too large"})
+        try:
+            _n, error = _pdf_take_attachment(path, att["key"], in_path, deadline)
+        except _AttachmentBudgetSpent as stop:
+            actions.append(
+                f"warning: {len(attachments) - i} embedded file(s) left unprocessed: {stop}"
+            )
+            return ok, skipped, True
+        if error:
+            skipped.append({**att, "error": error})
+            truncated = truncated or error == "attachment byte budget exhausted"
             continue
         ok.append({**att, "in_path": in_path})
-    return ok, skipped
+    return ok, skipped, truncated
 
 
 def _pdf_clean_attachments(
@@ -4374,40 +4478,61 @@ def _pdf_clean_attachments(
     Attachments are extracted from *path* (the original, unmodified input) and
     re-embedded into *dest*, because some earlier pass (the Ghostscript
     deep-image re-distill) may have dropped them from *dest*. Returns
-    ``{"attachments": [...], "processed": bool, "qpdf_absent": bool}``.
+    ``{"attachments": [...], "processed": bool, "qpdf_absent": bool,
+    "truncated": bool}``.
     """
     qpdf = which("qpdf")
     if not qpdf:
         actions.append(
             "warning: embedded-file attachments left in place; install qpdf for the attachment pass"
         )
-        return {"attachments": [], "processed": False, "qpdf_absent": True}
+        return {"attachments": [], "processed": False, "qpdf_absent": True, "truncated": False}
     if depth > MAX_ATTACHMENT_DEPTH:
         actions.append(f"warning: attachment recursion capped at depth {MAX_ATTACHMENT_DEPTH}")
-        return {"attachments": [], "processed": False, "qpdf_absent": False}
-    if deadline is not None and deadline.spent():
+        return {"attachments": [], "processed": False, "qpdf_absent": False, "truncated": True}
+    if deadline is None:
+        deadline = _Deadline(PDF_CLEAN_BUDGET_SECONDS)
+    if deadline.spent():
         actions.append("attachment pass skipped: clean budget exhausted")
-        return {"attachments": [], "processed": False, "qpdf_absent": False}
+        return {"attachments": [], "processed": False, "qpdf_absent": False, "truncated": True}
 
     results: list[dict] = []
     processed = False
     with tempfile.TemporaryDirectory(prefix="wr-att-") as staging:
-        attachments, skipped = _pdf_extract_attachments(path, deadline, Path(staging))
+        attachments, skipped, truncated = _pdf_extract_attachments(
+            path, deadline, Path(staging), actions
+        )
         if skipped:
             for att in skipped:
                 actions.append(f"skipped attachment '{att['name']}': {att['error']}")
                 results.append({**att, "kind": "unknown", "cleaned": False, "error": att["error"]})
         if not attachments:
-            if not skipped:
+            if not skipped and not truncated:
                 actions.append("no embedded attachments to clean")
-            return {"attachments": results, "processed": False, "qpdf_absent": False}
+            return {
+                "attachments": results,
+                "processed": False,
+                "qpdf_absent": False,
+                "truncated": truncated,
+            }
 
         # Did a re-distill drop the attachments from dest? If not, re-embedding
         # only the changed ones is enough; if so, every attachment is restored.
-        dest_has = bool(_pdf_attachment_list(dest, deadline))
+        # A listing that did not finish is not "dest has none": that reading
+        # re-adds files that are still embedded.
+        on_dest, dest_listed = _pdf_attachment_index(dest, deadline, limit=1)
+        if dest_listed < 0:
+            actions.append(
+                "warning: could not list attachments on output; left existing entries in place"
+            )
+            dest_has = True
+            truncated = True
+        else:
+            dest_has = bool(on_dest)
         for i, att in enumerate(attachments):
-            if deadline is not None and deadline.spent():
+            if deadline.spent():
                 actions.append("attachment pass stopped: clean budget exhausted")
+                truncated = True
                 break
             name = att["name"]
             in_path = att["in_path"]
@@ -4438,7 +4563,9 @@ def _pdf_clean_attachments(
                 ):
                     results[-1]["error"] = "re-embed failed"
                 continue
-            cleaned_bytes, clean_actions = _clean_attachment_bytes(in_path, data, kind, mode, depth)
+            cleaned_bytes, clean_actions = _clean_attachment_bytes(
+                in_path, data, kind, mode, depth, deadline
+            )
             if cleaned_bytes is None:
                 results.append(
                     {**report_att, "kind": kind, "cleaned": False, "error": "clean failed"}
@@ -4479,7 +4606,12 @@ def _pdf_clean_attachments(
 
     if processed:
         actions.append("embedded-file attachments cleaned")
-    return {"attachments": results, "processed": processed, "qpdf_absent": False}
+    return {
+        "attachments": results,
+        "processed": processed,
+        "qpdf_absent": False,
+        "truncated": truncated,
+    }
 
 
 def _add_attachment(
@@ -4518,6 +4650,8 @@ def _add_attachment(
     qpdf = which("qpdf")
     if not qpdf:
         return False
+    if deadline is not None and deadline.spent():
+        return False
     try:
         r = subprocess.run(
             [qpdf, *cmd],
@@ -4540,7 +4674,12 @@ def _add_attachment(
 
 
 def _clean_attachment_bytes(
-    tmp: Path, data: bytes, kind: str, mode: str, depth: int
+    tmp: Path,
+    data: bytes,
+    kind: str,
+    mode: str,
+    depth: int,
+    deadline: "_Deadline | None" = None,
 ) -> tuple[bytes | None, list[str]]:
     """Clean an extracted attachment with the matching unified pipeline."""
     if kind == "text":
@@ -4579,6 +4718,7 @@ def _clean_attachment_bytes(
             normalize_spaces=True,
             clean_attachments=mode,
             _depth=depth + 1,
+            _deadline=deadline,
         )
         if not dest.is_file():
             return None, []
@@ -4593,6 +4733,7 @@ def clean_pdf(
     deep_images: str = "auto",
     clean_attachments: str = DEFAULT_CLEAN_ATTACHMENTS,
     depth: int = 0,
+    deadline: "_Deadline | None" = None,
 ) -> tuple[list[str], dict]:
     """Best-effort PDF clean. Prefers exiftool; falls back to XMP strip warning.
 
@@ -4616,6 +4757,9 @@ def clean_pdf(
     * ``"auto"`` -- clean an attachment only when it carries AI/C2PA provenance
       markers; recurse with the same rule.
     * ``"never"`` -- leave attachments untouched.
+
+    ``deadline`` is the enclosing clean's budget when this PDF is itself an
+    attachment; a top-level call starts its own.
     """
     actions = actions_list()
     data = path.read_bytes()
@@ -4633,7 +4777,8 @@ def clean_pdf(
             f"got {clean_attachments!r}"
         )
 
-    deadline = _Deadline(PDF_CLEAN_BUDGET_SECONDS)
+    if deadline is None:
+        deadline = _Deadline(PDF_CLEAN_BUDGET_SECONDS)
 
     exiftool = which("exiftool")
     rewritten = False
@@ -4792,6 +4937,8 @@ def clean_pdf(
         "attachments": attachments["attachments"],
         "attachments_processed": attachments["processed"],
     }
+    if attachments.get("truncated"):
+        meta["attachments_truncated"] = True
     if not exiftool:
         # The deep pass may well have run, but the document-level strip was
         # the stdlib one, so the result is still best-effort.
@@ -4965,6 +5112,7 @@ def clean_container(
     normalize_spaces: bool = True,
     clean_attachments: str = DEFAULT_CLEAN_ATTACHMENTS,
     _depth: int = 0,
+    _deadline: "_Deadline | None" = None,
 ) -> dict[str, Any]:
     """Clean container metadata; optionally Layer-A scrub text bodies for md/html.
 
@@ -4999,6 +5147,7 @@ def clean_container(
             deep_images=deep_images,
             clean_attachments=clean_attachments,
             depth=_depth,
+            deadline=_deadline,
         )
         meta.update(meta_extra)
     elif fmt == "docx":
@@ -5062,7 +5211,7 @@ def clean_container(
     else:
         raise ValueError(f"unsupported container format: {fmt}")
 
-    after = inspect_container(dest)
+    after = inspect_container(dest, deadline=_deadline)
     changed = dest.read_bytes() != data
     return {
         "input": str(path),

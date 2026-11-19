@@ -113,6 +113,18 @@ def _peak(fn) -> int:
     return peak
 
 
+def _quiet_peak(fn, trials: int = 3) -> int:
+    """Lowest traced peak across a few trials.
+
+    tracemalloc's high-water mark only rises. A same-size bomb takes longer
+    to walk than the single-chunk control, so other threads in a full suite
+    (the HTTP server in particular) can push one sample over the allowance
+    on 3.13 without a chunk tuple being retained. A parser that keeps a
+    tuple per chunk is high on every trial, so the minimum still fails.
+    """
+    return min(_peak(fn) for _ in range(trials))
+
+
 def _assert_slope(label: str, parse) -> None:
     small = _empty_chunk_webp(SLOPE_SMALL)
     large = _empty_chunk_webp(CHUNK_COUNT)
@@ -129,12 +141,12 @@ def _assert_slope(label: str, parse) -> None:
     )
 
 
-def _assert_same_size(label: str, invoke, bomb: bytes, control: bytes) -> None:
+def _assert_same_size(label: str, invoke, bomb: bytes, control: bytes, measure=_peak) -> None:
     assert len(bomb) == len(control)
     invoke(control)
     invoke(bomb)
-    peak_control = _peak(lambda: invoke(control))
-    peak_bomb = _peak(lambda: invoke(bomb))
+    peak_control = measure(lambda: invoke(control))
+    peak_bomb = measure(lambda: invoke(bomb))
     delta = peak_bomb - peak_control
     assert delta < SAME_SIZE_ALLOWANCE, (
         f"{label}: empty-chunk WebP peaked {peak_bomb} bytes, "
@@ -386,7 +398,9 @@ def test_http_webp_does_not_retain_every_empty_chunk(path, conn, monkeypatch):
         assert status == 200, response
         assert response.get("ok") is True
 
-    _assert_same_size(path, invoke, bomb, control)
+    # One tracemalloc sample on 3.13 can clear the allowance while the
+    # in-process server thread allocates. The allowance itself is unchanged.
+    _assert_same_size(path, invoke, bomb, control, measure=_quiet_peak)
 
 
 def test_http_marked_webp_is_still_inspected(conn, monkeypatch):

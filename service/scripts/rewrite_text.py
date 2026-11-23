@@ -53,12 +53,15 @@ Security notes:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import itertools
 import json
 import os
 import random
 import re
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 import warnings
@@ -76,6 +79,7 @@ from text_unicode import clean_text
 DEFAULT_MARKLLM_MODEL = "facebook/opt-1.3b"
 DEFAULT_CANDIDATES = 1
 DEFAULT_MAX_LOOPS = 1
+DEFAULT_TIMEOUT = 120.0
 
 PROMPTS = {
     "paraphrase": (
@@ -427,7 +431,14 @@ _MLM_SKIP_WORDS = {
 }
 _MLM_TOKEN_RE = re.compile(r"(\s+|[.,;:!?()\"'—-])")
 _MLM_MAX_TOKENS = 512  # roberta-large positional limit
-_MLM_CACHE: dict[str, Any] = {}  # {"pipeline": ..., "mask_token": ...}
+# Per-call ceilings. A fill-mask forward is synchronous and cannot be interrupted,
+# so the timeout can only abandon work between windows; these cap what one caller
+# can queue at all.
+MLM_MAX_CHARS = 8192
+MLM_MAX_WINDOWS = 4
+# {"pipeline": ..., "mask_token": ..., "worker": (pipeline, executor)}
+_MLM_CACHE: dict[str, Any] = {}
+_MLM_LOCK = threading.Lock()
 
 
 def _cuda_available() -> bool:
@@ -440,14 +451,17 @@ def _cuda_available() -> bool:
         return False
 
 
-def _get_mlm() -> tuple[Any, str]:
-    """Return the process-cached roberta-large fill-mask pipeline + mask token.
+def preload_mlm() -> None:
+    """Load the roberta-large fill-mask pipeline into the process cache.
 
-    Built lazily on first use; a failed import surfaces as RuntimeError (fail-soft
-    optional dependency). The device is chosen at runtime so a CPU-only host still
-    works (architecture selects the accelerator when available).
+    Loading downloads and initialises the model, so it belongs at startup (the
+    server's ``--preload-mlm``, or the CLI before it reads its input), never on a
+    request. Idempotent. Failures surface as RuntimeError (optional dependency).
+    The device is chosen at runtime so a CPU-only host still works.
     """
-    if "pipeline" not in _MLM_CACHE:
+    with _MLM_LOCK:
+        if "pipeline" in _MLM_CACHE:
+            return
         try:
             from transformers import pipeline
         except Exception as e:  # fail-soft: optional dependency
@@ -455,9 +469,57 @@ def _get_mlm() -> tuple[Any, str]:
         kwargs: dict[str, Any] = {"model": "roberta-large"}
         if _cuda_available():
             kwargs["device"] = 0
-        _MLM_CACHE["pipeline"] = pipeline("fill-mask", **kwargs)
-        _MLM_CACHE["mask_token"] = _MLM_CACHE["pipeline"].tokenizer.mask_token
-    return _MLM_CACHE["pipeline"], _MLM_CACHE["mask_token"]
+        try:
+            pipe = pipeline("fill-mask", **kwargs)
+        except Exception as e:
+            raise RuntimeError(f"mlm model failed to load: {e}") from e
+        _MLM_CACHE["pipeline"] = pipe
+        _MLM_CACHE["mask_token"] = pipe.tokenizer.mask_token
+
+
+def mlm_ready() -> bool:
+    """True when the fill-mask pipeline has been preloaded."""
+    return "pipeline" in _MLM_CACHE
+
+
+def _get_mlm() -> tuple[Any, str]:
+    """Return the preloaded fill-mask pipeline + mask token; never loads it."""
+    pipe = _MLM_CACHE.get("pipeline")
+    if pipe is None:
+        raise RuntimeError(
+            "mlm model is not loaded; preload it at startup "
+            "(server --preload-mlm or WATERMARKS_MLM_PRELOAD=1)"
+        )
+    return pipe, _MLM_CACHE["mask_token"]
+
+
+def _mlm_worker(pipe: Any) -> concurrent.futures.ThreadPoolExecutor:
+    """Single-thread executor bound to *pipe*.
+
+    One forward runs at a time per loaded model, so a caller that times out
+    leaves at most one window running behind it, and queued windows it abandons
+    are cancelled before they start.
+    """
+    with _MLM_LOCK:
+        worker = _MLM_CACHE.get("worker")
+        if worker is None or worker[0] is not pipe:
+            if worker is not None:
+                worker[1].shutdown(wait=False, cancel_futures=True)
+            worker = (
+                pipe,
+                concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="mlm-infill"
+                ),
+            )
+            _MLM_CACHE["worker"] = worker
+        return worker[1]
+
+
+def _check_mlm_input(text: str) -> None:
+    if len(text) > MLM_MAX_CHARS:
+        raise RuntimeError(
+            f"mlm input is {len(text)} characters; the per-request limit is {MLM_MAX_CHARS}"
+        )
 
 
 def _mlm_chunks(parts: list[str], tokenizer: Any, max_tokens: int = _MLM_MAX_TOKENS):
@@ -465,29 +527,59 @@ def _mlm_chunks(parts: list[str], tokenizer: Any, max_tokens: int = _MLM_MAX_TOK
 
     Chunk boundaries fall on separator/word edges, so each chunk joins to a clean
     substring, preserving ordering across chunks. Yields (global_start, chunk).
+
+    Each word is counted together with the whitespace before it (how roberta's
+    byte-level BPE pre-tokenizes it), and each distinct unit is tokenized once,
+    so the tokenizer sees at most the input's length in total.
     """
+    budget = max_tokens - 2  # <s> and </s>
+    counts: dict[str, int] = {}
     cur: list[str] = []
     cur_start = 0
+    cur_len = 0
+    unit_start = 0
+    last = len(parts) - 1
     for i, part in enumerate(parts):
-        trial = [*cur, part]
-        if cur and len(tokenizer("".join(trial))["input_ids"]) > max_tokens:
+        if (not part or part.isspace()) and i < last:
+            continue
+        unit = parts[unit_start : i + 1]
+        key = "".join(unit)
+        if key not in counts:
+            counts[key] = len(tokenizer(key, add_special_tokens=False)["input_ids"])
+        n = counts[key]
+        if cur and cur_len + n > budget:
             yield cur_start, cur
-            cur = [part]
-            cur_start = i
-        else:
-            cur = trial
+            cur, cur_start, cur_len = [], unit_start, 0
+        cur.extend(unit)
+        cur_len += n
+        unit_start = i + 1
     if cur:
         yield cur_start, cur
 
 
-def _mlm_infill(text: str, level: float) -> str:
+def _mlm_infill(
+    text: str,
+    level: float,
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    deadline: float | None = None,
+) -> str:
     """Mask `level` of content words and infill with roberta-large (local edit).
 
     Non-autoregressive: the output is a mix of the original token stream and
-    masked-LM predictions, not fresh LLM-sampled prose. Uses a process-cached,
-    runtime-device pipeline and splits inputs longer than roberta's positional
-    limit into separately-infilled chunks.
+    masked-LM predictions, not fresh LLM-sampled prose. Uses the preloaded
+    pipeline and splits inputs longer than roberta's positional limit into
+    separately-infilled chunks.
+
+    Bounded per call: input over ``MLM_MAX_CHARS`` or needing more than
+    ``MLM_MAX_WINDOWS`` fill-mask windows is rejected (RuntimeError) before any
+    inference, and the whole call must finish within ``timeout`` seconds (and by
+    the monotonic ``deadline`` when given), else TimeoutError.
     """
+    end = time.monotonic() + timeout
+    if deadline is not None:
+        end = min(end, deadline)
+    _check_mlm_input(text)
     mlm, mask_token = _get_mlm()
     tokenizer = mlm.tokenizer
     tokens = _MLM_TOKEN_RE.split(text)
@@ -511,11 +603,27 @@ def _mlm_infill(text: str, level: float) -> str:
         mset.add(idx)
         pos += step
     out_parts = [mask_token if i in mset else tokens[i] for i in range(len(tokens))]
+    windows = []
     for chunk_start, chunk in _mlm_chunks(out_parts, tokenizer):
         positions = [chunk_start + j for j, p in enumerate(chunk) if p == mask_token]
-        if not positions:
-            continue
-        preds = mlm("".join(chunk), top_k=1)
+        if positions:
+            windows.append((chunk, positions))
+    if len(windows) > MLM_MAX_WINDOWS:
+        raise RuntimeError(
+            f"mlm input needs {len(windows)} fill-mask windows; the per-request "
+            f"limit is {MLM_MAX_WINDOWS}"
+        )
+    worker = _mlm_worker(mlm)
+    for chunk, positions in windows:
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"mlm infill exceeded its {timeout:g}s budget")
+        future = worker.submit(mlm, "".join(chunk), top_k=1)
+        try:
+            preds = future.result(timeout=remaining)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise TimeoutError(f"mlm infill exceeded its {timeout:g}s budget") from None
         picks = [(p if isinstance(p, dict) else p[0]) for p in preds]
         for k_i, global_idx in enumerate(positions):
             if k_i < len(picks):
@@ -860,7 +968,7 @@ def rewrite(
     def _generate_candidate() -> str:
         """Generate a single rewrite candidate via configured backend."""
         if is_mlm:
-            return _mlm_infill(text, rewrite_level or 0.3)
+            return _mlm_infill(text, rewrite_level or 0.3, timeout=timeout)
         if is_chunk:
             pairs = _split_units(text)
             if chunk_shuffle:
@@ -1117,13 +1225,14 @@ def apply_strategy(
     model: str | None,
     base_url: str | None,
     api_key: str | None,
-    timeout: float = 120.0,
+    timeout: float = DEFAULT_TIMEOUT,
     temperature: float = 0.9,
     reasoning_effort: str | None = None,
     lang: str = "French",
     original_lang: str = "English",
     style: str | None = None,
     layer_a_after: bool = False,
+    mlm_deadline: float | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Apply a strategy's steps sequentially to *text* (best-effort rewrite).
 
@@ -1133,6 +1242,10 @@ def apply_strategy(
     local masked-LM edit; every other tactic makes one backend generation via
     ``build_prompt``/``_generate_once``. Returns (final_text, stats) where stats
     carries per-step tactic/intensity/input-output lengths.
+
+    All ``mlm`` steps together must finish within ``timeout`` of the call (and by
+    the monotonic ``mlm_deadline`` when given), so repeating the step does not
+    multiply the budget.
     """
     needs_llm = any(t in LLM_TACTICS for t, _ in steps)
     if needs_llm:
@@ -1140,13 +1253,18 @@ def apply_strategy(
             raise RuntimeError(f"strategy needs an LLM backend, got {backend!r}")
         if not model or not base_url:
             raise RuntimeError("strategy needs --model and --base-url for LLM steps")
+    if any(t == "mlm" for t, _ in steps):
+        _check_mlm_input(text)
+    mlm_end = time.monotonic() + timeout
+    if mlm_deadline is not None:
+        mlm_end = min(mlm_end, mlm_deadline)
 
     cur = text
     step_stats: list[dict[str, Any]] = []
     for tactic, intensity in steps:
         in_chars = len(cur)
         if tactic == "mlm":
-            cur = _mlm_infill(cur, intensity)
+            cur = _mlm_infill(cur, intensity, timeout=timeout, deadline=mlm_end)
         else:
             prompt = build_prompt(
                 tactic,
@@ -1286,7 +1404,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--lang", default="French", help="Pivot language for backtranslate")
     p.add_argument("--original-lang", default="English")
-    p.add_argument("--timeout", type=float, default=120.0)
+    p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     p.add_argument(
         "--temperature",
         type=float,
@@ -1366,12 +1484,6 @@ def main() -> int:
         eprint(f"error: --rewrite-level must be in (0,1], got {args.rewrite_level}")
         return 2
 
-    text = read_text_input(args.path, allow_binary=args.force_text)
-    allow_remote = (
-        args.allow_remote
-        if args.allow_remote is not None
-        else _flag_env("WATERMARKS_REWRITE_ALLOW_REMOTE")
-    )
     steps: list[tuple[str, float]] | None = None
     if args.strategy:
         try:
@@ -1379,6 +1491,24 @@ def main() -> int:
         except ValueError as e:
             eprint(f"error: {e}")
             return 2
+    uses_mlm = (
+        any(t == "mlm" for t, _ in steps)
+        if steps is not None
+        else args.tactic == "mlm" and args.backend != "print-prompt"
+    )
+    if uses_mlm:
+        try:
+            preload_mlm()
+        except RuntimeError as e:
+            eprint(f"rewrite failed: {e}")
+            return 1
+
+    text = read_text_input(args.path, allow_binary=args.force_text)
+    allow_remote = (
+        args.allow_remote
+        if args.allow_remote is not None
+        else _flag_env("WATERMARKS_REWRITE_ALLOW_REMOTE")
+    )
     try:
         if steps is not None:
             # Enforce the remote-endpoint policy for a strategy, same as the

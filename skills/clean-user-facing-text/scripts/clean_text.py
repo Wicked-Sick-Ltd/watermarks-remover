@@ -11,9 +11,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from common import (
+    MAX_INPUT_BYTES,
     backup_path,
     cleaned_path,
     eprint,
+    guard_binary,
+    read_in_place_source,
     read_text_input,
     write_text_output,
 )
@@ -59,7 +62,13 @@ def main() -> int:
     )
     args = p.parse_args()
 
-    text = read_text_input(args.path, allow_binary=args.force_text)
+    source = None
+    if args.in_place and args.path not in (None, "-"):
+        source = read_in_place_source(args.path, limit=MAX_INPUT_BYTES)
+        guard_binary(source, args.path, allow_binary=args.force_text)
+        text = source.decode("utf-8", errors="surrogateescape")
+    else:
+        text = read_text_input(args.path, allow_binary=args.force_text)
     cleaned, stats = clean_text(
         text,
         nfkc=args.nfkc,
@@ -76,7 +85,7 @@ def main() -> int:
             return 2
         # CLI opens the file the user named; no extra concatenation.
         src = Path(args.path)  # nosemgrep: tainted-path-traversal-stdlib
-        bak, created = backup_path(src)
+        bak, created = backup_path(src, source)
         if not created:
             eprint(f"backup {bak} already exists from an earlier run; keeping the original backup")
         out = str(src)

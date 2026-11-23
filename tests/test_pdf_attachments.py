@@ -12,6 +12,8 @@ import base64
 import struct
 import subprocess
 import sys
+import time
+import zlib
 from pathlib import Path
 
 import pytest
@@ -319,3 +321,217 @@ def test_inspect_attachments_respects_deadline(tmp_path):
 
     assert attachments == []
     assert truncated is True
+
+
+def _pdf_sharing_one_stream(path: Path, count: int, payload: bytes) -> Path:
+    """A PDF whose name tree lists *count* files that all point at one stream.
+
+    The upload stays tiny however large *count* gets, which is what makes the
+    per-entry work worth bounding.
+    """
+    comp = zlib.compress(payload, 9)
+    objs = {
+        1: b"<< /Type /Catalog /Pages 2 0 R /Names << /EmbeddedFiles 4 0 R >> >>",
+        2: b"<< /Type /Pages /Kids [] /Count 0 >>",
+        3: b"<< /Type /EmbeddedFile /Filter /FlateDecode /Length %d /Params << /Size %d >> >>"
+        b"\nstream\n%s\nendstream" % (len(comp), len(payload), comp),
+    }
+    names = []
+    for i in range(count):
+        name = b"f%05d.txt" % i
+        objs[5 + i] = b"<< /Type /Filespec /F (%s) /UF (%s) /EF << /F 3 0 R >> >>" % (name, name)
+        names.append(b"(%s) %d 0 R" % (name, 5 + i))
+    objs[4] = b"<< /Names [" + b" ".join(names) + b"] >>"
+    out = bytearray(b"%PDF-1.7\n")
+    offsets = {}
+    for num in sorted(objs):
+        offsets[num] = len(out)
+        out += b"%d 0 obj\n%s\nendobj\n" % (num, objs[num])
+    xref = len(out)
+    size = max(objs) + 1
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % size
+    out += b"".join(b"%010d 00000 n \n" % offsets[n] for n in range(1, size))
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (size, xref)
+    path.write_bytes(bytes(out))
+    return path
+
+
+def _count_extractions(monkeypatch, on_launch=None) -> list[list[str]]:
+    """Record every ``qpdf --show-attachment`` process the module starts."""
+    launched: list[list[str]] = []
+    real_popen = subprocess.Popen
+
+    def spy(args, *a, **kw):
+        if any(str(arg).startswith("--show-attachment=") for arg in args):
+            launched.append([str(arg) for arg in args])
+            if on_launch is not None:
+                on_launch()
+        return real_popen(args, *a, **kw)
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    return launched
+
+
+def _capture_deadlines(monkeypatch) -> list:
+    made: list = []
+
+    class Recording(container_meta._Deadline):
+        def __init__(self, budget: float) -> None:
+            super().__init__(budget)
+            made.append(self)
+
+    monkeypatch.setattr(container_meta, "_Deadline", Recording)
+    return made
+
+
+@needs_qpdf
+def test_clean_caps_how_many_attachments_it_extracts(tmp_path, monkeypatch):
+    """One PDF must not get a qpdf process per name-tree entry without limit."""
+    monkeypatch.setattr(container_meta, "MAX_ATTACHMENT_COUNT", 8, raising=False)
+    src = _pdf_sharing_one_stream(tmp_path / "in.pdf", 20, b"same bytes")
+    launched = _count_extractions(monkeypatch)
+
+    actions, meta = clean_pdf(src, tmp_path / "out.pdf", deep_images="never")
+
+    assert len(launched) <= 8, f"{len(launched)} extractions for a cap of 8"
+    assert meta.get("attachments_truncated") is True
+    assert any("count cap" in a for a in actions)
+
+
+@needs_qpdf
+def test_clean_stops_extracting_once_the_budget_is_spent(tmp_path, monkeypatch):
+    """A spent budget must end the walk, not start-and-kill one qpdf per entry."""
+    src = _pdf_sharing_one_stream(tmp_path / "in.pdf", 10, b"same bytes")
+    deadlines = _capture_deadlines(monkeypatch)
+
+    def spend_budget() -> None:
+        for d in deadlines:
+            d._end = time.monotonic() - 1
+
+    launched = _count_extractions(monkeypatch, on_launch=spend_budget)
+
+    clean_pdf(src, tmp_path / "out.pdf", deep_images="never")
+
+    assert len(launched) == 1, f"{len(launched)} extractions after the budget ran out"
+
+
+@needs_qpdf
+def test_extracted_attachment_bytes_are_capped_in_total(tmp_path, monkeypatch):
+    """Each file under the per-file cap must still not add up without limit."""
+    monkeypatch.setattr(container_meta, "MAX_ATTACHMENT_TOTAL_BYTES", 3500, raising=False)
+    src = _pdf_sharing_one_stream(tmp_path / "in.pdf", 20, b"A" * 1000)
+    written: list[int] = []
+    real_show = container_meta._pdf_show_attachment
+
+    def measure(path, key, tmp, *args, **kwargs):
+        n = real_show(path, key, tmp, *args, **kwargs)
+        written.append(tmp.stat().st_size if tmp.exists() else 0)
+        return n
+
+    monkeypatch.setattr(container_meta, "_pdf_show_attachment", measure)
+
+    _actions, meta = clean_pdf(src, tmp_path / "out.pdf", deep_images="never")
+
+    assert sum(written) <= 3500, f"{sum(written)} bytes extracted for a 3500-byte budget"
+    assert any(a.get("error") == "attachment byte budget exhausted" for a in meta["attachments"])
+
+
+@needs_qpdf
+def test_nested_pdf_attachment_spends_the_parent_budget(tmp_path, monkeypatch):
+    """Cleaning an embedded PDF must not start a fresh clean budget of its own."""
+    inner = _pdf_with_attachments(tmp_path, [("inner.txt", b"hi")])
+    outer_dir = tmp_path / "outer"
+    outer_dir.mkdir()
+    outer = _pdf_with_attachments(outer_dir, [("inner.pdf", inner.read_bytes())])
+    deadlines = _capture_deadlines(monkeypatch)
+
+    _actions, meta = clean_pdf(outer, tmp_path / "out.pdf", deep_images="never")
+
+    assert meta["attachments"][0]["cleaned"] is True
+    assert len(deadlines) == 1, f"{len(deadlines)} clean budgets for one request"
+
+
+def test_deadline_timeout_is_zero_once_spent():
+    assert container_meta._Deadline(0).timeout(60.0) == 0.0
+
+
+def _qpdf_present(monkeypatch) -> None:
+    monkeypatch.setattr(container_meta, "which", lambda _name: "qpdf")
+
+
+def test_tiny_timeout_is_not_an_empty_attachment_list(monkeypatch, tmp_path):
+    """A not-yet-spent deadline can hand qpdf a near-zero timeout.
+
+    Timing out must not look like a finished listing of zero files, or the
+    clean pass reports "no embedded attachments" with truncated false.
+    """
+    _qpdf_present(monkeypatch)
+    seen: dict[str, float] = {}
+
+    def run(_args, **kwargs):
+        seen["timeout"] = kwargs["timeout"]
+        raise subprocess.TimeoutExpired(cmd="qpdf", timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(container_meta._Deadline, "timeout", lambda _self, _cap: 1e-4)
+
+    pdf = tmp_path / "in.pdf"
+    pdf.write_bytes(b"%PDF-1.7\n")
+    deadline = container_meta._Deadline(30)
+    _attachments, listed = container_meta._pdf_attachment_index(pdf, deadline, None)
+    assert seen["timeout"] < 0.01
+    assert listed < 0
+
+    actions: list[str] = []
+    meta = container_meta._pdf_clean_attachments(
+        pdf, tmp_path / "out.pdf", actions, deadline, "always", depth=0
+    )
+    assert meta["truncated"] is True
+    assert not any("no embedded attachments" in action for action in actions)
+
+    inspected, truncated = container_meta._pdf_inspect_attachments(pdf, deadline, depth=0)
+    assert inspected == []
+    assert truncated is True
+
+
+def test_failed_dest_listing_does_not_readd_files_still_there(monkeypatch, tmp_path):
+    """When the output listing times out, dest still having files is not "no"."""
+    _qpdf_present(monkeypatch)
+    src = tmp_path / "in.pdf"
+    dest = tmp_path / "out.pdf"
+    src.write_bytes(b"%PDF-1.7\n")
+    dest.write_bytes(b"%PDF-1.7\n")
+    payload = (
+        '{"attachments":{"note":{"preferredname":"note.txt","names":{},'
+        '"streams":{"1":{"mimetype":"text/plain"}}}}}'
+    )
+    calls = {"n": 0}
+
+    def run(_args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return subprocess.CompletedProcess(_args, 0, stdout=payload, stderr="")
+        raise subprocess.TimeoutExpired(cmd="qpdf", timeout=kwargs.get("timeout", 0))
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    def take(_path, _key, tmp, _deadline):
+        tmp.write_bytes(b"hello")
+        return 4, None
+
+    added: list[bool] = []
+
+    def add(*_args, remove_existing, **_kwargs):
+        added.append(remove_existing)
+        return True
+
+    monkeypatch.setattr(container_meta, "_pdf_take_attachment", take)
+    monkeypatch.setattr(container_meta, "_add_attachment", add)
+
+    actions: list[str] = []
+    meta = container_meta._pdf_clean_attachments(
+        src, dest, actions, container_meta._Deadline(30), "never", depth=0
+    )
+    assert meta["truncated"] is True
+    assert added == []
+    assert any("could not list attachments on output" in action for action in actions)

@@ -31,7 +31,8 @@ the batch. Capped at WATERMARKS_MAX_BATCH_FILES entries per request (default
 size the same as a single-file request.
 
 Hardening mirrors the CLIs: input size caps, binary-as-text guard, atomic
-writes, loopback-only bind by default, optional bearer API key. Run it as an
+writes, loopback-only bind by default, optional bearer API key (required
+when MARKLLM_DIR enables MarkLLM text detection). Run it as an
 unprivileged user (the Docker image does). Intended for a trusted network;
 expose through a reverse proxy if reachable from untrusted clients.
 """
@@ -91,8 +92,15 @@ from text_watermark import (
 VERSION = os.environ.get("WATERMARKS_SERVER_VERSION", "dev")
 
 # Optional bearer token: when set, every request must send
-# `Authorization: Bearer <key>`. Empty means no auth (default).
+# `Authorization: Bearer <key>`. Empty means no auth (default), except when
+# MARKLLM_DIR is set: then every request is refused until a key is configured.
 API_KEY = os.environ.get("WATERMARKS_SERVER_API_KEY", "").strip()
+
+
+def _markllm_enabled() -> bool:
+    """MarkLLM detection loads a language model per call, so it needs the API key."""
+    return bool(os.environ.get("MARKLLM_DIR", "").strip())
+
 
 # Body cap for the JSON envelope. Base64 inflates by 4/3, so the decoded file
 # stays well under MAX_INPUT_BYTES for the same cap.
@@ -430,7 +438,13 @@ def _watermark_request_schema() -> dict[str, Any]:
                         exclusiveMinimum=True,
                         maximum=1,
                     ),
-                    "model": _schema(type="string"),
+                    "model": _schema(
+                        type="string",
+                        description=(
+                            "Hugging Face model id; must be the backend default "
+                            "(facebook/opt-1.3b) or listed in WATERMARKS_ALLOWED_TEXT_MODELS"
+                        ),
+                    ),
                     "device": _schema(
                         type="string",
                         description="Inference device (e.g. 'cpu', 'cuda', 'cuda:0')",
@@ -971,13 +985,20 @@ def _load_default_strategy(config_path: Path) -> str | None:
     return spec
 
 
-def _apply_layer_b(text: str, strategy: str, options: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+def _apply_layer_b(
+    text: str,
+    strategy: str,
+    options: dict[str, Any],
+    *,
+    deadline: float | None = None,
+) -> tuple[str, dict[str, Any]]:
     """Apply a Layer B rewrite strategy to *text*, rejecting if unavailable.
 
     Raises ValueError for an unconfigured/unavailable backend or model so the
     caller surfaces a 400 rather than a 500. Wraps runtime failures the same way.
+    ``deadline`` (monotonic) bounds the ``mlm`` steps of a multi-file request.
     """
-    from rewrite_text import LLM_TACTICS, apply_strategy, parse_strategy
+    from rewrite_text import LLM_TACTICS, apply_strategy, mlm_ready, parse_strategy
 
     steps = parse_strategy(strategy)
     needs_llm = any(t in LLM_TACTICS for t, _ in steps)
@@ -998,11 +1019,11 @@ def _apply_layer_b(text: str, strategy: str, options: dict[str, Any]) -> tuple[s
             if needs_key:
                 required += "/API_KEY"
             raise ValueError(f"Layer B strategy needs the rewrite backend configured ({required})")
-    if any(t == "mlm" for t, _ in steps):
-        import importlib.util
-
-        if importlib.util.find_spec("transformers") is None:
-            raise ValueError("Layer B 'mlm' step requires transformers")
+    if any(t == "mlm" for t, _ in steps) and not mlm_ready():
+        raise ValueError(
+            "Layer B 'mlm' step requires transformers and the roberta-large model "
+            "preloaded at startup (--preload-mlm or WATERMARKS_MLM_PRELOAD=1)"
+        )
     base_url = os.environ.get("WATERMARKS_REWRITE_BASE_URL")
     if needs_llm and base_url:
         host = urlparse(base_url).hostname or ""
@@ -1033,6 +1054,7 @@ def _apply_layer_b(text: str, strategy: str, options: dict[str, Any]) -> tuple[s
             ),
             style=options.get("style"),
             layer_a_after=bool(options.get("also_layer_a_text")),
+            mlm_deadline=deadline,
         )
     except (RuntimeError, TimeoutError, urllib.error.URLError) as e:
         raise ValueError(f"Layer B rewrite failed: {e}") from e
@@ -1234,7 +1256,13 @@ def _detect_payload(data: bytes, name: str) -> dict[str, Any]:
             }
 
 
-def _clean_payload(data: bytes, name: str, options: dict[str, Any]) -> dict[str, Any]:
+def _clean_payload(
+    data: bytes,
+    name: str,
+    options: dict[str, Any],
+    *,
+    layer_b_deadline: float | None = None,
+) -> dict[str, Any]:
     kind = classify_bytes(data, allowlisted_suffix(name))
     if kind == "unknown":
         raise ValueError(
@@ -1273,7 +1301,7 @@ def _clean_payload(data: bytes, name: str, options: dict[str, Any]) -> dict[str,
                     "default strategy (config/clean_strategy.json) or pass "
                     "options.strategy"
                 )
-            cleaned, layer_b = _apply_layer_b(cleaned, strategy, options)
+            cleaned, layer_b = _apply_layer_b(cleaned, strategy, options, deadline=layer_b_deadline)
             if detect_after:
                 detector_reports["after"] = run_text_detectors(cleaned)
             cleaned_bytes = cleaned.encode("utf-8", errors="surrogateescape")
@@ -1431,7 +1459,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _authorized(self) -> bool:
         if not API_KEY:
-            return True
+            return not _markllm_enabled()
         header = self.headers.get("Authorization", "")
         return header == f"Bearer {API_KEY}"
 
@@ -1569,14 +1597,18 @@ class Handler(BaseHTTPRequestHandler):
         self._respond(HTTPStatus.OK, _clean_payload(data, name, options))
 
     def _handle_clean_batch(self, body: dict[str, Any]) -> None:
+        from rewrite_text import DEFAULT_TIMEOUT
+
         items = _batch_items(body)
+        # One mlm budget for the whole batch, the same a single /clean gets.
+        layer_b_deadline = time.monotonic() + DEFAULT_TIMEOUT
         results = []
         for name, data, options, error in items:
             if error is not None:
                 results.append({"name": name, "ok": False, "error": error})
                 continue
             try:
-                payload = _clean_payload(data, name, options)
+                payload = _clean_payload(data, name, options, layer_b_deadline=layer_b_deadline)
             except ValueError as e:
                 results.append({"name": name, "ok": False, "error": str(e)})
                 continue
@@ -1691,6 +1723,16 @@ def main() -> int:
         "config/clean_strategy.json; WATERMARKS_CLEAN_STRATEGY_FILE). A strategy "
         "step is 'tactic@intensity' (e.g. 'paraphrase@0.8,mlm@0.2').",
     )
+    p.add_argument(
+        "--preload-mlm",
+        action="store_true",
+        default=os.environ.get("WATERMARKS_MLM_PRELOAD", "").strip().lower()
+        in ("1", "true", "yes", "on"),
+        help="Load roberta-large for the Layer B 'mlm' step at startup and exit if "
+        "it cannot load (WATERMARKS_MLM_PRELOAD=1). Without it the model is still "
+        "loaded at startup when the default strategy has an 'mlm' step; requests "
+        "never load it, so 'mlm' steps are rejected when it is not loaded.",
+    )
     p.add_argument("-V", "--version", action="store_true", help="print version and exit")
     args = p.parse_args()
 
@@ -1702,10 +1744,29 @@ def main() -> int:
     global _DEFAULT_STRATEGY  # noqa: PLW0603 — loaded once at startup
     _DEFAULT_STRATEGY = _load_default_strategy(Path(args.strategy_config))
 
+    from rewrite_text import parse_strategy, preload_mlm
+
+    default_uses_mlm = bool(_DEFAULT_STRATEGY) and any(
+        t == "mlm" for t, _ in parse_strategy(_DEFAULT_STRATEGY)
+    )
+    if args.preload_mlm or default_uses_mlm:
+        try:
+            preload_mlm()
+        except RuntimeError as e:
+            if args.preload_mlm:
+                raise SystemExit(f"error: {e}") from e
+            eprint(f"warning: {e}; Layer B 'mlm' steps will be rejected")
+
     if args.host not in ("127.0.0.1", "localhost", "::1"):
         eprint(f"warning: binding {args.host} — intended for a trusted network only")
     if API_KEY:
         eprint("API key required for requests")
+    elif _markllm_enabled():
+        eprint(
+            "error: MARKLLM_DIR is set, so an API key is required "
+            "(set WATERMARKS_SERVER_API_KEY or pass --api-key)"
+        )
+        return 2
     else:
         eprint("warning: no API key set — only bind to loopback or a trusted network")
 

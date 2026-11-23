@@ -7,6 +7,7 @@ Stdlib-first; PDF prefers optional exiftool/c2patool when present.
 import base64
 import bisect
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -26,9 +27,11 @@ from typing import Any
 from xml.etree import ElementTree as ET
 
 from common import (
+    actions_list,
     c2patool_probe_note,
     classify_finding_confidence,
     confined_path,
+    findings_list,
     safe_arg,
     safe_write_bytes,
     safe_write_text,
@@ -347,7 +350,7 @@ def detect_container_format(path: Path, data: bytes | None = None) -> str:
 
 def _blob_hits(blob: bytes) -> tuple[bool, bool, list[str]]:
     lower = blob.lower()
-    findings: list[str] = []
+    findings = findings_list()
     has_c2pa = False
     has_ai = False
     for n in C2PA_MARKERS:
@@ -439,7 +442,7 @@ def _skip_data_uri_candidate(text: str, start: int) -> int:
 def _inspect_embedded_data_uris(text: str) -> tuple[bool, bool, list[str]]:
     has_c2pa = False
     has_ai = False
-    findings: list[str] = []
+    findings = findings_list()
 
     for _start, _end, mime, params, payload in _iter_data_uris(text):
         mime_l = mime.lower()
@@ -488,7 +491,7 @@ def _inspect_embedded_data_uris(text: str) -> tuple[bool, bool, list[str]]:
 def _clean_embedded_data_uris(
     text: str, *, strip_all_metadata: bool = True
 ) -> tuple[str, list[str]]:
-    actions: list[str] = []
+    actions = actions_list()
 
     def _clean_one(mime: str, params: str, payload: str) -> str | None:
         """Return the rebuilt data URI, or None when nothing changed."""
@@ -568,21 +571,20 @@ def _iter_tag_blocks(text, open_re, close_re):
     """Yield (open_start, open_end, close_start, close_end) for each block.
 
     Works on str and bytes alike. Linear in len(text): closing tags are
-    collected once with finditer and consumed by a forward pointer, so an
-    unbounded run of unclosed opening tags costs one pass, not one rescan per
-    opening tag.
+    consumed lazily by a forward pointer, so an unbounded run of unclosed
+    opening tags costs one pass, not one rescan per opening tag, and memory
+    stays constant however many blocks the text holds.
     """
-    closes = list(close_re.finditer(text))
-    ci = 0
+    closes = close_re.finditer(text)
+    cm = next(closes, None)
     last_end = 0
     for om in open_re.finditer(text):
         if om.start() < last_end:
             continue
-        while ci < len(closes) and closes[ci].start() < om.end():
-            ci += 1
-        if ci >= len(closes):
+        while cm is not None and cm.start() < om.end():
+            cm = next(closes, None)
+        if cm is None:
             return
-        cm = closes[ci]
         yield om.start(), om.end(), cm.start(), cm.end()
         last_end = cm.end()
 
@@ -669,17 +671,43 @@ def _md_prose_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _provenance_comments(text: str, spans: list[tuple[int, int]] | None = None) -> list[str]:
-    """Return the provenance comment blocks found inside spans (default: all)."""
-    found: list[str] = []
+def _provenance_comments(text: str, spans: list[tuple[int, int]] | None = None) -> Iterator[str]:
+    """Yield the provenance comment blocks found inside spans (default: all)."""
     for a, b in spans if spans is not None else [(0, len(text))]:
         seg = text[a:b]
         for os_, _oe, _cs, ce in _iter_tag_blocks(
             seg, _MARKUP_COMMENT_OPEN_RE, _MARKUP_COMMENT_CLOSE_RE
         ):
             if _comment_is_provenance(seg[os_:ce]):
-                found.append(seg[os_:ce])
-    return found
+                yield seg[os_:ce]
+
+
+# Markup inspectors report one finding per matching comment/tag/attribute. An
+# upload can repeat a short match millions of times, so only the first few of
+# each kind are kept verbatim and the rest are summarised as a count.
+_MAX_FINDINGS_PER_KIND = 20
+
+
+class _FindingSampler:
+    """Append up to _MAX_FINDINGS_PER_KIND findings of one kind, count the rest."""
+
+    def __init__(self, findings: list[str], prefix: str, noun: str) -> None:
+        self._findings = findings
+        self._prefix = prefix
+        self._noun = noun
+        self.total = 0
+
+    def add(self, detail: str) -> None:
+        self.total += 1
+        if self.total <= _MAX_FINDINGS_PER_KIND:
+            self._findings.append(f"{self._prefix}: {detail}")
+
+    def close(self) -> None:
+        extra = self.total - _MAX_FINDINGS_PER_KIND
+        if extra > 0:
+            self._findings.append(
+                f"{self._prefix}: {extra} more {self._noun} not listed ({self.total} total)"
+            )
 
 
 def _drop_provenance_comments(
@@ -773,10 +801,20 @@ def _is_agent_frontmatter(keys: list[str]) -> bool:
 
 
 def inspect_markdown(text: str) -> tuple[bool, bool, list[str], dict]:
-    findings: list[str] = []
+    findings = findings_list()
     has_ai = False
     has_fm = False
+    c2pa_hint = False
     keys = []
+
+    # Judged per entry: the capped list may not keep every finding.
+    def note(finding: str) -> None:
+        nonlocal c2pa_hint
+        low = finding.lower()
+        if "c2pa" in low or "content" in low:
+            c2pa_hint = True
+        findings.append(finding)
+
     m = _FM_RE.match(text)
     if m:
         has_fm = True
@@ -790,31 +828,39 @@ def inspect_markdown(text: str) -> tuple[bool, bool, list[str], dict]:
                 pass  # agent configuration, not provenance -- value still checked below
             elif key.lower() in AI_FRONTMATTER_KEYS or AI_META_NAME_RE.search(key):
                 has_ai = True
-                findings.append(f"frontmatter key: {key}")
+                note(f"frontmatter key: {key}")
             # also check value -- it may span continuation lines (block
             # scalars, wrapped values, list items), so scan the joined text
             val = _fm_joined_value(rows, idx, block_lines)
             if named_value_is_ai(key, val):
                 has_ai = True
-                findings.append(f"frontmatter value hit on {key}")
+                note(f"frontmatter value hit on {key}")
 
+    comment_c2pa = False
+    comments = _FindingSampler(findings, "comment", "provenance comments")
     for block in _provenance_comments(text, _md_prose_spans(text)):
         has_ai = True
-        findings.append(f"comment: {block[:120]}")
+        sample = block[:120]
+        comments.add(sample)
+        if not comment_c2pa:
+            low = sample.lower()
+            comment_c2pa = "c2pa" in low or "content" in low
+    comments.close()
 
     uri_c2pa, uri_ai, uri_findings = _inspect_embedded_data_uris(text)
     if uri_c2pa:
         has_ai = True
     if uri_ai:
         has_ai = True
-    findings.extend(uri_findings)
+    for finding in uri_findings:
+        note(finding)
 
-    c2pa = uri_c2pa or any("c2pa" in f.lower() or "content" in f.lower() for f in findings)
+    c2pa = uri_c2pa or c2pa_hint or comment_c2pa
     return c2pa, has_ai, findings, {"has_frontmatter": has_fm, "keys": keys}
 
 
 def clean_markdown(text: str) -> tuple[str, list[str]]:
-    actions: list[str] = []
+    actions = actions_list()
     m = _FM_RE.match(text)
     if m:
         block = m.group(1)
@@ -1323,7 +1369,7 @@ def inspect_latex(text: str) -> tuple[bool, bool, list[str], dict]:
     dropped-entry counts. Skips % comments and verbatim/listings content so
     only live \hypersetup/\pdfinfo metadata and literal comment lines are seen.
     """
-    findings: list[str] = []
+    findings = findings_list()
     has_ai = False
     has_c2pa = False
     keys_dropped = 0
@@ -1368,7 +1414,7 @@ def clean_latex(text: str) -> tuple[str, list[str]]:
     % comments plus % !TEX tooling comments and Emacs/Vim modelines. Verbatim and
     listings content is left untouched. Returns (text, actions).
     """
-    actions: list[str] = []
+    actions = actions_list()
     out: list[str] = []
     last = 0
     for cmd, arg, start, end in _latex_iter_meta_commands(text):
@@ -1648,18 +1694,23 @@ def _script_tag_is_jsonld(open_tag: str) -> bool:
 
 
 def inspect_html(text: str) -> tuple[bool, bool, list[str], dict]:
-    findings: list[str] = []
+    findings = findings_list()
     has_ai = False
     has_c2pa = False
-    for tag in _META_TAG_RE.findall(text):
+    cms_metas = _FindingSampler(findings, "info: cms generator", "generator meta tags")
+    ai_metas = _FindingSampler(findings, "meta", "AI meta tags")
+    for tm in _META_TAG_RE.finditer(text):
+        tag = tm.group(0)
         if re.search(r"c2pa|content.?credential", tag, re.I):
             has_c2pa = True
         if _is_cms_generator_meta(tag):
-            findings.append(f"info: cms generator: {tag[:120]}")
+            cms_metas.add(tag[:120])
             continue
         if _meta_tag_is_ai(tag):
             has_ai = True
-            findings.append(f"meta: {tag[:120]}")
+            ai_metas.add(tag[:120])
+    cms_metas.close()
+    ai_metas.close()
     for os_, oe, _cs, ce in _iter_script_blocks(text):
         if not _script_tag_is_jsonld(text[os_:oe]):
             continue
@@ -1671,17 +1722,21 @@ def inspect_html(text: str) -> tuple[bool, bool, list[str], dict]:
             findings.append("json-ld provenance-like block")
             if re.search(r"c2pa|contentcredential", blob, re.I):
                 has_c2pa = True
+    comments = _FindingSampler(findings, "comment", "provenance comments")
     for block in _provenance_comments(text):
         has_ai = True
-        findings.append(f"comment: {block[:120]}")
+        comments.add(block[:120])
         if re.search(r"c2pa|content.?credential", block, re.I):
             has_c2pa = True
+    comments.close()
     # data-ai* attributes. The optional separator group keeps the match to
     # the bare `data-ai` attribute or a `data-ai-*`/`data-ai_*` provenance name;
     # without it, `data-aid` / `data-airline` matched too (issue #395).
+    attrs = _FindingSampler(findings, "attr", "data-ai attributes")
     for m in re.finditer(r"\bdata-ai(?:[-_][\w-]*)?\s*=\s*[\"'][^\"']*[\"']", text, re.I):
         has_ai = True
-        findings.append(f"attr: {m.group(0)[:80]}")
+        attrs.add(m.group(0)[:80])
+    attrs.close()
 
     uri_c2pa, uri_ai, uri_findings = _inspect_embedded_data_uris(text)
     if uri_c2pa:
@@ -1694,7 +1749,7 @@ def inspect_html(text: str) -> tuple[bool, bool, list[str], dict]:
 
 
 def clean_html(text: str) -> tuple[str, list[str]]:
-    actions: list[str] = []
+    actions = actions_list()
 
     def _meta_sub(m: re.Match[str]) -> str:
         tag = m.group(0)
@@ -1764,7 +1819,7 @@ _SVG_COMMENT_CLOSE_RE = re.compile(r"--!?>")
 
 
 def inspect_svg(data: bytes) -> tuple[bool, bool, list[str], dict]:
-    findings: list[str] = []
+    findings = findings_list()
     has_c2pa, has_ai, hits = _blob_hits(data)
     findings.extend(hits)
     try:
@@ -2000,7 +2055,7 @@ def clean_svg(data: bytes) -> tuple[bytes, list[str]]:
     the document body, CDATA sections, comments, and quoted attribute values are
     preserved.
     """
-    actions: list[str] = []
+    actions = actions_list()
     text = data.decode("utf-8", errors="surrogateescape")
     # Drop metadata blocks (linear scan - lazy .*? is quadratic on unclosed tags)
     new, n = _drop_tag_blocks(text, _SVG_METADATA_OPEN_RE, _SVG_METADATA_CLOSE_RE)
@@ -2156,7 +2211,7 @@ class _WebExtensionFindingsTarget:
 
 def _webextension_findings(name: str, raw: bytes) -> list[str]:
     """Report Office add-in properties and references without scanning body text."""
-    findings: list[str] = []
+    findings = findings_list()
 
     def on_start(tag: str, attributes: dict[str, str]) -> None:
         local_name = tag.rsplit("}", 1)[-1].casefold()
@@ -2197,7 +2252,7 @@ def _webextension_findings(name: str, raw: bytes) -> list[str]:
 def _inspect_ooxml_zip(
     data: bytes, fmt: str, budget: list[int] | None = None
 ) -> tuple[bool, bool, list[str], dict]:
-    findings: list[str] = []
+    findings = findings_list()
     has_c2pa = False
     has_ai = False
     parts: list[str] = []
@@ -2719,7 +2774,7 @@ def _scrub_ooxml_zip(
     when requested. Binary docProps members (e.g. the thumbnail) are kept
     byte-safe. Returns the rewritten bytes and a list of human-readable actions.
     """
-    actions: list[str] = []
+    actions = actions_list()
     budget = [0]
     layer_removed = 0
     layer_replaced = 0
@@ -2919,7 +2974,7 @@ def clean_pptx(
 
 
 def inspect_odt(data: bytes) -> tuple[bool, bool, list[str], dict]:
-    findings: list[str] = []
+    findings = findings_list()
     has_c2pa = False
     has_ai = False
     budget = [0]
@@ -2956,7 +3011,7 @@ def inspect_odt(data: bytes) -> tuple[bool, bool, list[str], dict]:
 def clean_odt(
     data: bytes, *, also_layer_a_text: bool = True, normalize_spaces: bool = True
 ) -> tuple[bytes, list[str]]:
-    actions: list[str] = []
+    actions = actions_list()
     budget = [0]
     layer_removed = 0
     layer_replaced = 0
@@ -3068,72 +3123,293 @@ def _epub_content_part(name: str) -> bool:
     )
 
 
-def _epub_encrypted_parts(data: bytes) -> set[str]:
-    """Return part names listed as encrypted in META-INF/encryption.xml (OCF)."""
-    try:
-        with zipfile.ZipFile(io.BytesIO(data)) as zf:
-            if "META-INF/encryption.xml" not in zf.namelist():
-                return set()
-            budget: list[int] = [0]
-            xml = _read_zip_member(zf, zf.getinfo("META-INF/encryption.xml"), budget).decode(
-                "utf-8", errors="replace"
-            )
-    except (zipfile.BadZipFile, KeyError):
-        return set()
+_EPUB_ENCRYPTION_MANIFEST = "META-INF/encryption.xml"
+
+# Font obfuscation XORs the head of a resource with a key derived from the
+# package's own identifier. A reading system undoes it with data in the book,
+# so the scanner can too; the value is how many leading bytes are XORed.
+_EPUB_OBFUSCATION_ALGORITHMS = {
+    "http://www.idpf.org/2008/embedding": 1040,
+    "http://ns.adobe.com/pdf/enc#RC": 1024,
+}
+_EPUB_FONT_RE = re.compile(r"\.(ttf|otf|woff2?)$", re.I)
+_EPUB_FONT_MAGIC = (b"\x00\x01\x00\x00", b"OTTO", b"true", b"typ1", b"ttcf", b"wOFF", b"wOF2")
+_EPUB_MARKUP_RE = re.compile(r"\.(xhtml|html?|opf|ncx|xml|svg|smil)$", re.I)
+
+# Gates read has_c2pa / has_ai_metadata and classify findings by their text,
+# so this wording is what makes an unread part fail them (see common.py).
+_EPUB_UNREAD_FINDING = "encrypted content not readable; scan inconclusive"
+
+
+@dataclass(frozen=True)
+class _EpubEncryption:
+    """What META-INF/encryption.xml claims, keyed by archive member name.
+
+    A listing is only a claim: it decides which parts *may* be opaque, never
+    which parts are skipped. ``list_all`` is set when a manifest exists but
+    could not be read, so every part is treated as possibly listed.
+    """
+
+    algorithms: dict[str, str] = field(default_factory=dict)
+    obfuscation_keys: dict[str, bytes] = field(default_factory=dict)
+    list_all: bool = False
+
+    def lists(self, name: str) -> bool:
+        return self.list_all or _epub_part_key(name) in self.algorithms
+
+    def algorithm(self, name: str) -> str:
+        return self.algorithms.get(_epub_part_key(name), "")
+
+
+def _epub_part_key(name: str) -> str:
+    """Compare part names the loosest way a reading system might.
+
+    A looser match only sends more parts through the readability check; a
+    stricter one would let ciphertext a reader still decrypts pass as an
+    unlisted part with nothing in it.
+    """
+    return posixpath.normpath(name.replace("\\", "/")).lstrip("/").casefold()
+
+
+def _xml_local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _epub_cipher_targets(uri: str) -> set[str]:
+    """Every part key (see _epub_part_key) a CipherReference URI might mean.
+
+    The URI is relative to META-INF/ per OCF, but producers are not
+    consistent, so accept every plausible normalization. Over-matching only
+    puts more parts through the readability check below.
+    """
     names: set[str] = set()
-    for uri in re.findall(r'CipherReference\s+URI="([^"]+)"', xml, re.I):
-        # The URI is relative to META-INF/ per OCF, but producers are not
-        # consistent, so accept every plausible normalization.
-        names.add(posixpath.normpath(posixpath.join("META-INF", uri)))
-        names.add(posixpath.normpath(uri))
-        if uri.startswith("../"):
-            names.add(posixpath.normpath(uri[3:]))
+    for form in {uri, urllib.parse.unquote(uri)}:
+        candidate = form.strip()
+        if not candidate:
+            continue
+        names.add(_epub_part_key(posixpath.join("META-INF", candidate)))
+        names.add(_epub_part_key(candidate))
+        if candidate.startswith("../"):
+            names.add(_epub_part_key(candidate[3:]))
     return names
 
 
-def inspect_epub(data: bytes) -> tuple[bool, bool, list[str], dict]:
+def _parse_epub_encryption_xml(raw: bytes) -> dict[str, str] | None:
+    """Map each CipherReference target to its EncryptionMethod algorithm.
+
+    The algorithm is '' when the entry names none. Returns None when the
+    manifest cannot be parsed, so the caller can fail closed.
+    """
+    # stdlib ET does not resolve external entities, but internal entity
+    # expansion is still possible, so DTDs are refused outright.
+    if b"<!DOCTYPE" in raw or b"<!ENTITY" in raw:
+        return None
+    try:
+        root = ET.fromstring(raw)  # noqa: S314 - DTD/entity declarations rejected above
+    except ET.ParseError:
+        return None
+
+    # Only a direct EncryptionMethod child of EncryptedData describes the data;
+    # one nested under KeyInfo describes a wrapped key.
+    method_of: dict[int, str] = {}
+    for enc in root.iter():
+        if _xml_local(enc.tag) != "EncryptedData":
+            continue
+        algorithm = ""
+        for child in enc:
+            if _xml_local(child.tag) == "EncryptionMethod":
+                algorithm = (child.get("Algorithm") or "").strip()
+        for child in enc:
+            if _xml_local(child.tag) != "CipherData":
+                continue
+            for ref in child:
+                if _xml_local(ref.tag) == "CipherReference":
+                    method_of[id(ref)] = algorithm
+
+    entries: dict[str, str] = {}
+    for ref in root.iter():
+        if _xml_local(ref.tag) != "CipherReference":
+            continue
+        uri = next((v for k, v in ref.attrib.items() if _xml_local(k).lower() == "uri"), "")
+        algorithm = method_of.get(id(ref), "")
+        for name in _epub_cipher_targets(uri):
+            # Two entries disagreeing on one part leave no method to rely on.
+            entries[name] = algorithm if entries.get(name, algorithm) == algorithm else ""
+    return entries
+
+
+def _epub_obfuscation_keys(zf: zipfile.ZipFile, budget: list[int]) -> dict[str, bytes]:
+    """Derive the font de-obfuscation keys from the package identifiers."""
+    try:
+        container = _read_zip_member(zf, zf.getinfo("META-INF/container.xml"), budget)
+        m = re.search(rb'full-path\s*=\s*["\']([^"\']+)["\']', container)
+        if not m:
+            return {}
+        opf_name = m.group(1).decode("utf-8", errors="replace")
+        opf = _read_zip_member(zf, zf.getinfo(opf_name), budget).decode("utf-8", errors="replace")
+    except (KeyError, *_ZIP_PARSE_ERRORS):
+        return {}
+
+    from xml.sax.saxutils import unescape
+
+    identifiers: dict[str, str] = {}
+    values: list[str] = []
+    for im in re.finditer(r"<(?:[\w.-]+:)?identifier\b([^>]*)>([^<]*)<", opf, re.I):
+        value = unescape(im.group(2))
+        values.append(value)
+        id_m = re.search(r"""\bid\s*=\s*["']([^"']*)["']""", im.group(1))
+        if id_m:
+            identifiers.setdefault(id_m.group(1), value)
+
+    keys: dict[str, bytes] = {}
+    uid_m = re.search(
+        r"""<(?:[\w.-]+:)?package\b[^>]*?\bunique-identifier\s*=\s*["']([^"']+)["']""", opf
+    )
+    if uid_m and uid_m.group(1) in identifiers:
+        stripped = re.sub(r"[\x20\x09\x0d\x0a]", "", identifiers[uid_m.group(1)])
+        keys["http://www.idpf.org/2008/embedding"] = hashlib.sha1(  # noqa: S324 - OCF-defined key derivation
+            stripped.encode("utf-8")
+        ).digest()
+    for value in values:
+        if value.strip().lower().startswith("urn:uuid:"):
+            hex_digits = re.sub(r"[^0-9a-fA-F]", "", value.strip()[9:])
+            if len(hex_digits) == 32:
+                keys["http://ns.adobe.com/pdf/enc#RC"] = bytes.fromhex(hex_digits)
+                break
+    return keys
+
+
+def _epub_encryption(data: bytes) -> _EpubEncryption:
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except _ZIP_PARSE_ERRORS:
+        return _EpubEncryption()
+    with zf:
+        manifest_key = _epub_part_key(_EPUB_ENCRYPTION_MANIFEST)
+        manifests = [i for i in zf.infolist() if _epub_part_key(i.filename) == manifest_key]
+        if not manifests:
+            return _EpubEncryption()
+        budget: list[int] = [0]
+        keys = _epub_obfuscation_keys(zf, budget)
+        algorithms: dict[str, str] = {}
+        for info in manifests:
+            try:
+                parsed = _parse_epub_encryption_xml(_read_zip_member(zf, info, budget))
+            except _ZIP_PARSE_ERRORS:
+                parsed = None
+            if parsed is None:
+                return _EpubEncryption(obfuscation_keys=keys, list_all=True)
+            for name, algorithm in parsed.items():
+                agreed = algorithms.get(name, algorithm) == algorithm
+                algorithms[name] = algorithm if agreed else ""
+    return _EpubEncryption(algorithms=algorithms, obfuscation_keys=keys)
+
+
+def _epub_readable_as_declared(name: str, raw: bytes) -> bool:
+    """True when *raw* reads as the content type the part's name declares."""
+    low = name.lower()
+    if _EPUB_FONT_RE.search(low):
+        return raw.startswith(_EPUB_FONT_MAGIC)
+    if _EPUB_MEDIA_RE.search(low) and not low.endswith(".svg"):
+        return detect_image_format(raw) != "unknown"
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    if "\x00" in text:
+        return False
+    if _EPUB_MARKUP_RE.search(low):
+        return text.lstrip("\ufeff \t\r\n").startswith("<")
+    return True
+
+
+def _epub_deobfuscate(raw: bytes, key: bytes, span: int) -> bytes:
+    head = bytes(b ^ key[i % len(key)] for i, b in enumerate(raw[:span]))
+    return head + raw[span:]
+
+
+def _epub_scan_views(enc: _EpubEncryption, name: str, raw: bytes) -> list[tuple[str, bytes]] | None:
+    """The byte views of one part to inspect, labelled for findings.
+
+    An unlisted part is just its bytes. A listed part is inspected whenever
+    its bytes read as its declared type, whatever the manifest claims; under
+    font obfuscation the de-obfuscated bytes a reading system renders are
+    inspected as well. None means no view is readable: the part is opaque and
+    the scan of it is inconclusive.
+    """
+    views = [(name, raw)]
+    if not enc.lists(name):
+        return views
+    algorithm = enc.algorithm(name)
+    span = _EPUB_OBFUSCATION_ALGORITHMS.get(algorithm)
+    key = enc.obfuscation_keys.get(algorithm)
+    if span and key:
+        views.append((f"{name} (de-obfuscated)", _epub_deobfuscate(raw, key, span)))
+    if any(_epub_readable_as_declared(name, view) for _, view in views):
+        return views
+    return None
+
+
+def _epub_copy_through(enc: _EpubEncryption, name: str, raw: bytes) -> bool:
+    """True when rewriting *raw* as its declared type would corrupt it."""
+    return enc.lists(name) and not _epub_readable_as_declared(name, raw)
+
+
+def _inspect_epub_part(name: str, label: str, raw: bytes) -> tuple[bool, bool, list[str]]:
+    low = name.lower()
     findings: list[str] = []
+    if low.endswith((".xhtml", ".html", ".htm")):
+        text = raw.decode("utf-8", errors="surrogateescape")
+        c2, ai, sub, _ = inspect_html(text)
+        findings.extend(f"{label}: {f}" for f in sub)
+        return c2, ai, findings
+    has_c2pa = False
+    has_ai = False
+    if low.endswith(".opf"):
+        text = raw.decode("utf-8", errors="surrogateescape")
+        if AI_META_NAME_RE.search(text):
+            has_ai = True
+            findings.append(f"{label}: AI-ish metadata in package document")
+    c2, ai, hits = _blob_hits(raw)
+    if c2 or ai:
+        has_c2pa = has_c2pa or c2
+        has_ai = has_ai or ai
+        findings.append(f"{label}: {', '.join(hits[:6])}")
+    return has_c2pa, has_ai, findings
+
+
+def inspect_epub(data: bytes) -> tuple[bool, bool, list[str], dict]:
+    findings = findings_list()
     has_c2pa = False
     has_ai = False
     budget = [0]
-    encrypted = _epub_encrypted_parts(data)
+    enc = _epub_encryption(data)
     names: list[str] = []
+    unread = 0
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             names = zf.namelist()
             for info in zf.infolist():
                 _check_zip_budget(info, budget)
                 name = info.filename
-                if name in encrypted:
-                    findings.append(f"{name}: encrypted content (skipped)")
-                    continue
                 raw = _read_zip_member(zf, info, budget)
-                if name.lower().endswith((".xhtml", ".html", ".htm")):
-                    text = raw.decode("utf-8", errors="surrogateescape")
-                    c2, ai, sub, _ = inspect_html(text)
-                    if c2:
-                        has_c2pa = True
-                    if ai:
-                        has_ai = True
-                    for f in sub:
-                        findings.append(f"{name}: {f}")
-                    continue
-                if name.lower().endswith(".opf"):
-                    text = raw.decode("utf-8", errors="surrogateescape")
-                    if AI_META_NAME_RE.search(text):
-                        has_ai = True
-                        findings.append(f"{name}: AI-ish metadata in package document")
+                views = _epub_scan_views(enc, name, raw)
+                if views is None:
+                    # Nothing here could be read, so nothing here is cleared:
+                    # the part counts against the file until it can be.
+                    unread += 1
+                    has_ai = True
+                    findings.append(f"{name}: {_EPUB_UNREAD_FINDING}")
                     c2, ai, hits = _blob_hits(raw)
                     if c2 or ai:
                         has_c2pa = has_c2pa or c2
-                        has_ai = has_ai or ai
                         findings.append(f"{name}: {', '.join(hits[:6])}")
                     continue
-                c2, ai, hits = _blob_hits(raw)
-                if c2 or ai:
+                for label, view in views:
+                    c2, ai, sub = _inspect_epub_part(name, label, view)
                     has_c2pa = has_c2pa or c2
                     has_ai = has_ai or ai
-                    findings.append(f"{name}: {', '.join(hits[:6])}")
+                    findings.extend(sub)
     except _ZIP_PARSE_ERRORS as exc:
         # EPUB previously caught only BadZipFile, so a zlib error propagated
         # (crashing the scan) while a CRC failure discarded everything —
@@ -3146,7 +3422,10 @@ def inspect_epub(data: bytes) -> tuple[bool, bool, list[str], dict]:
             )
             return has_c2pa, has_ai or has_c2pa, findings, {"parts": len(names)}
         return False, False, ["not a valid EPUB zip"], {}
-    return has_c2pa, has_ai or has_c2pa, findings, {"parts": len(names)}
+    details: dict[str, Any] = {"parts": len(names)}
+    if unread:
+        details["unread_parts"] = unread
+    return has_c2pa, has_ai or has_c2pa, findings, details
 
 
 # Open/close tag halves for the linear OPF scans in _scrub_epub_opf.
@@ -3164,7 +3443,7 @@ _DC_FIELDS_CLOSE_RE = re.compile(
 
 def _scrub_epub_opf(text: str) -> tuple[str, list[str]]:
     """Scrub AI-ish metadata from the EPUB package document (OPF)."""
-    actions: list[str] = []
+    actions = actions_list()
 
     def _meta(m: re.Match[str]) -> str:
         tag = m.group(0)
@@ -3230,19 +3509,21 @@ def clean_epub(
 
     Embedded raster/SVG media get their own metadata stripped; structural and
     OCF control parts (mimetype, container.xml, encryption.xml, relationships,
-    fonts) are kept so the book stays readable. Parts listed in
-    META-INF/encryption.xml are copied verbatim — their bytes are ciphertext,
-    so any rewrite would corrupt them. Non-content parts carrying AI/C2PA
-    markers are dropped, and the OPF manifest is pruned afterwards so no
-    dropped part stays referenced.
+    fonts) are kept so the book stays readable. A part listed in
+    META-INF/encryption.xml is copied verbatim only when its bytes do not read
+    as its declared type, since a rewrite would corrupt ciphertext; a listed
+    part stored in the clear is cleaned like any other, and the post-clean
+    inspection reports any part it still cannot read as unread. Non-content
+    parts carrying AI/C2PA markers are dropped, and the OPF manifest is pruned
+    afterwards so no dropped part stays referenced.
     """
     from text_unicode import clean_text  # local import to avoid cycles
 
-    actions: list[str] = []
+    actions = actions_list()
     budget = [0]
     layer_removed = 0
     layer_replaced = 0
-    encrypted = _epub_encrypted_parts(data)
+    enc = _epub_encryption(data)
     kept: list[tuple[zipfile.ZipInfo, bytes]] = []
     dropped: set[str] = set()
     with zipfile.ZipFile(io.BytesIO(data)) as zin:
@@ -3252,8 +3533,7 @@ def clean_epub(
             raw = _read_zip_member(zin, info, budget)
             low = name.lower()
 
-            # Encrypted parts are opaque ciphertext: pass through untouched.
-            if name in encrypted:
+            if _epub_copy_through(enc, name, raw):
                 kept.append((info, raw))
                 continue
 
@@ -3394,7 +3674,7 @@ def inspect_pdf(
     include_attachments: bool = True,
     deadline: "_Deadline | None" = None,
 ) -> tuple[bool, bool, list[str], dict]:
-    findings: list[str] = []
+    findings = findings_list()
     has_c2pa, has_ai, hits = _blob_hits(_pdf_structured_blob(data))
     findings.extend(f"pdf-structured:{h}" for h in hits)
     # XMP packet scan
@@ -3629,10 +3909,17 @@ _GHOSTSCRIPT_TIMEOUT = 300.0
 
 
 class _Deadline:
-    """What is left of a shared budget, clamped to each tool's own ceiling."""
+    """What is left of a shared budget, clamped to each tool's own ceiling.
+
+    Besides wall clock it carries the embedded-file allowance: how many more
+    attachments may be extracted and how many bytes they may write. Nested
+    containers spend the same object, so one request has one allowance.
+    """
 
     def __init__(self, budget: float) -> None:
         self._end = time.monotonic() + budget
+        self.attachments_left = MAX_ATTACHMENT_COUNT
+        self.attachment_bytes_left = MAX_ATTACHMENT_TOTAL_BYTES
 
     def remaining(self) -> float:
         return max(0.0, self._end - time.monotonic())
@@ -3641,8 +3928,9 @@ class _Deadline:
         return self.remaining() <= 0.0
 
     def timeout(self, cap: float) -> float:
-        # Never hand subprocess 0: it would raise instead of running.
-        return max(1.0, min(cap, self.remaining()))
+        # Callers check spent() before starting a child. A floor here would
+        # hand every child time the budget no longer has.
+        return min(cap, self.remaining())
 
 
 _GHOSTSCRIPT_NAMES = ("gs", "gswin64c", "gswin32c")
@@ -3794,7 +4082,16 @@ CLEAN_ATTACHMENT_MODES = frozenset({"auto", "always", "never"})
 DEFAULT_CLEAN_ATTACHMENTS = "always"
 MAX_ATTACHMENT_DEPTH = 3
 MAX_ATTACHMENT_BYTES = 64 * 1024 * 1024
+# Per clean or inspect, nested containers included. A name tree can list
+# thousands of files that all point at one small compressed stream, so neither
+# the upload size nor the per-file cap bounds the extraction work.
+MAX_ATTACHMENT_COUNT = 256
+MAX_ATTACHMENT_TOTAL_BYTES = 256 * 1024 * 1024
 _QPDF_ATTACH_TIMEOUT = 60.0
+
+
+class _AttachmentBudgetSpent(Exception):
+    """Raised before starting qpdf when the shared attachment allowance is gone."""
 
 
 def _pdf_iso_to_pdf_date(iso: str | None) -> str | None:
@@ -3824,18 +4121,41 @@ def _pdf_iso_to_pdf_date(iso: str | None) -> str | None:
     return f"D:{y}{mo}{d}{h}{mi}{s}{sign}{oh}'{om}'"
 
 
-def _pdf_attachment_list(path: Path, deadline: "_Deadline | None" = None) -> list[dict]:
+# ``listed`` when the attachment index did not finish. Distinct from 0, which
+# means qpdf listed the file and it has no embedded files. A near-zero
+# ``timeout()`` makes ``subprocess.run`` raise ``TimeoutExpired`` before qpdf
+# can answer; that must not look like an empty name tree.
+_ATTACHMENT_LIST_INCOMPLETE = -1
+
+
+def _pdf_attachment_list(
+    path: Path, deadline: "_Deadline | None" = None, limit: int | None = None
+) -> list[dict]:
     """Enumerate a PDF's embedded files via ``qpdf --json``.
 
     Returns a list of ``{key, name, mimetype, description, creationdate,
-    modificationdate}`` in PDF order. Empty when qpdf is absent, the budget is
-    spent, or the PDF carries no attachments.
+    modificationdate}`` in PDF order, at most *limit* long. Empty when qpdf is
+    absent, the listing did not finish, or the PDF carries no attachments.
+    Callers that have to tell those apart must use ``_pdf_attachment_index``.
+    """
+    return _pdf_attachment_index(path, deadline, limit)[0]
+
+
+def _pdf_attachment_index(
+    path: Path, deadline: "_Deadline | None", limit: int | None
+) -> tuple[list[dict], int]:
+    """``(first *limit* attachments, how many the PDF lists in total)``.
+
+    The count is ``_ATTACHMENT_LIST_INCOMPLETE`` when the budget was already
+    spent or qpdf timed out, including a not-yet-spent deadline whose
+    ``timeout()`` is too small for the process to finish. That is not an
+    empty listing.
     """
     qpdf = which("qpdf")
     if not qpdf:
-        return []
+        return [], 0
     if deadline is not None and deadline.spent():
-        return []
+        return [], _ATTACHMENT_LIST_INCOMPLETE
     try:
         r = subprocess.run(
             [qpdf, "--json", "--json-key=attachments", "--", safe_arg(str(path))],
@@ -3848,16 +4168,23 @@ def _pdf_attachment_list(path: Path, deadline: "_Deadline | None" = None) -> lis
             preexec_fn=subprocess_preexec_fn,
             creationflags=subprocess_creationflags,
         )
+    except subprocess.TimeoutExpired:
+        return [], _ATTACHMENT_LIST_INCOMPLETE
     except Exception:
-        return []
+        return [], 0
     if r.returncode != 0:
-        return []
+        return [], 0
     try:
         payload = json.loads(r.stdout)
     except Exception:
-        return []
+        return [], 0
+    listed = payload.get("attachments") or {}
+    if not isinstance(listed, dict):
+        return [], 0
     out: list[dict] = []
-    for key, info in (payload.get("attachments") or {}).items():
+    for key, info in listed.items():
+        if limit is not None and len(out) >= limit:
+            break
         if not isinstance(info, dict):
             continue
         names = info.get("names") or {}
@@ -3875,7 +4202,7 @@ def _pdf_attachment_list(path: Path, deadline: "_Deadline | None" = None) -> lis
                 "named_UF": names.get("/UF"),
             }
         )
-    return out
+    return out, sum(isinstance(info, dict) for info in listed.values())
 
 
 def _watchdog_kill(process: "subprocess.Popen[bytes]", seconds: float) -> threading.Event:
@@ -3896,21 +4223,57 @@ def _watchdog_kill(process: "subprocess.Popen[bytes]", seconds: float) -> thread
     return stop
 
 
-def _pdf_show_attachment(path: Path, key: str, tmp: Path, deadline: "_Deadline | None") -> int:
-    """Extract one embedded file to *tmp*, bounding the write to the size cap.
+def _pdf_take_attachment(
+    path: Path, key: str, tmp: Path, deadline: "_Deadline"
+) -> tuple[int, str | None]:
+    """Extract one embedded file to *tmp*, charging it to the shared allowance.
 
-    Returns the byte count on success (``<= MAX_ATTACHMENT_BYTES``),
-    ``MAX_ATTACHMENT_BYTES + 1`` when the attachment exceeds the cap (the
-    subprocess is terminated and *tmp* is left partial), or ``-1`` on failure.
-    qpdf's output is consumed in bounded chunks so an embedded stream that
-    expands well past the cap is not written to disk in full before being
-    rejected, and a watchdog enforces the deadline/``_QPDF_ATTACH_TIMEOUT`` even
-    when qpdf stops producing output.
+    Raises ``_AttachmentBudgetSpent`` without starting qpdf once the clock, the
+    file count or the byte allowance is used up. Otherwise returns
+    ``(bytes, None)``, or ``(-1, reason)`` with nothing left at *tmp*.
+    """
+    if deadline.spent():
+        raise _AttachmentBudgetSpent("clean budget exhausted")
+    if deadline.attachments_left <= 0:
+        raise _AttachmentBudgetSpent("attachment count cap reached")
+    if deadline.attachment_bytes_left <= 0:
+        raise _AttachmentBudgetSpent("attachment byte budget exhausted")
+    deadline.attachments_left -= 1
+    limit = min(MAX_ATTACHMENT_BYTES, deadline.attachment_bytes_left)
+    n = _pdf_show_attachment(path, key, tmp, deadline, limit=limit)
+    deadline.attachment_bytes_left -= tmp.stat().st_size if tmp.is_file() else 0
+    if 0 <= n <= limit:
+        return n, None
+    tmp.unlink(missing_ok=True)
+    if n < 0:
+        return -1, "extract failed"
+    if limit < MAX_ATTACHMENT_BYTES:
+        deadline.attachment_bytes_left = 0
+        return -1, "attachment byte budget exhausted"
+    return -1, "attachment too large"
+
+
+def _pdf_show_attachment(
+    path: Path,
+    key: str,
+    tmp: Path,
+    deadline: "_Deadline | None",
+    limit: int = MAX_ATTACHMENT_BYTES,
+) -> int:
+    """Extract one embedded file to *tmp*, bounding the write to *limit*.
+
+    Returns the byte count on success (``<= limit``), ``limit + 1`` when the
+    attachment exceeds it (the subprocess is terminated and *tmp* is left
+    partial), or ``-1`` on failure. qpdf's output is consumed in bounded chunks
+    so an embedded stream that expands well past the cap is not written to disk
+    in full before being rejected, and a watchdog enforces the
+    deadline/``_QPDF_ATTACH_TIMEOUT`` even when qpdf stops producing output.
     """
     qpdf = which("qpdf")
     if not qpdf:
         return -1
-    limit = MAX_ATTACHMENT_BYTES
+    if deadline is not None and deadline.spent():
+        return -1
     total = 0
     timeout = _QPDF_ATTACH_TIMEOUT if deadline is None else deadline.timeout(_QPDF_ATTACH_TIMEOUT)
     try:
@@ -3987,28 +4350,34 @@ def _pdf_inspect_attachments(
     """
     if depth > MAX_ATTACHMENT_DEPTH:
         return [], True
-    if deadline is not None and deadline.spent():
+    if deadline is None:
+        deadline = _Deadline(PDF_CLEAN_BUDGET_SECONDS)
+    if deadline.spent():
         return [], True
-    attachments = _pdf_attachment_list(path, deadline)
+    attachments, listed = _pdf_attachment_index(path, deadline, deadline.attachments_left)
+    if listed < 0:
+        return [], True
     results: list[dict] = []
-    truncated = False
+    truncated = listed > len(attachments)
     with tempfile.TemporaryDirectory(prefix="wr-att-insp-") as staging:
         for i, att in enumerate(attachments):
             # Sanitise the temp name: keep the suffix so classification works,
             # drop any directory separators in the attachment's own name.
             safe_name = Path(att["name"]).name or f"att-{i}"
             tmp = confined_path(staging, f"att-{i}{_attachment_suffix(safe_name)}")
-            n = _pdf_show_attachment(path, att["key"], tmp, deadline)
-            if n < 0:
-                results.append({**att, "kind": "unknown", "error": "extract failed"})
-                continue
-            if n > MAX_ATTACHMENT_BYTES:
-                results.append({**att, "kind": "unknown", "error": "attachment too large"})
+            try:
+                _n, error = _pdf_take_attachment(path, att["key"], tmp, deadline)
+            except _AttachmentBudgetSpent:
                 truncated = True
+                break
+            if error:
+                results.append({**att, "kind": "unknown", "error": error})
+                truncated = truncated or error != "extract failed"
                 continue
             data = tmp.read_bytes()
             kind = _classify_attachment(att["name"], data)
             has_c2pa, has_ai, findings = _inspect_attachment_bytes(tmp, data, kind, depth, deadline)
+            tmp.unlink(missing_ok=True)
             results.append(
                 {
                     **att,
@@ -4018,7 +4387,7 @@ def _pdf_inspect_attachments(
                     "findings": findings,
                 }
             )
-            if deadline is not None and deadline.spent():
+            if deadline.spent():
                 truncated = True
                 break
     return results, truncated
@@ -4053,32 +4422,47 @@ def _inspect_attachment_bytes(
 
 
 def _pdf_extract_attachments(
-    path: Path, deadline: "_Deadline | None", staging: Path
-) -> tuple[list[dict], list[dict]]:
-    """Extract every embedded file into *staging*.
+    path: Path, deadline: "_Deadline", staging: Path, actions: list[str]
+) -> tuple[list[dict], list[dict], bool]:
+    """Extract embedded files into *staging*, within the shared allowance.
 
-    Returns ``(ok, skipped)``: ``ok`` entries carry ``in_path``; ``skipped``
-    entries carry an ``error`` (extract failed / over size cap) so the clean
-    pass can report what it could not touch rather than dropping it silently.
+    Returns ``(ok, skipped, truncated)``: ``ok`` entries carry ``in_path``;
+    ``skipped`` entries carry an ``error`` (extract failed / over size cap) so
+    the clean pass can report what it could not touch rather than dropping it
+    silently. ``truncated`` is true when the count cap, byte allowance or clock
+    ended the walk early; the files never reached are counted in *actions*.
     Used up front in ``clean_pdf`` so attachment bytes are preserved even when
     the Ghostscript deep-image pass — which re-distills the page and drops
     embedded files — runs later.
     """
-    attachments = _pdf_attachment_list(path, deadline)
+    attachments, listed = _pdf_attachment_index(path, deadline, deadline.attachments_left)
+    if listed < 0:
+        actions.append("warning: embedded-file list did not finish (clean budget)")
+        return [], [], True
     ok: list[dict] = []
     skipped: list[dict] = []
+    if listed > len(attachments):
+        actions.append(
+            f"warning: {listed - len(attachments)} embedded file(s) beyond the "
+            f"attachment count cap ({MAX_ATTACHMENT_COUNT}) left unprocessed"
+        )
+    truncated = listed > len(attachments)
     for i, att in enumerate(attachments):
         safe_name = Path(att["name"]).name or f"att-{i}"
         in_path = confined_path(staging, f"{i}-in{_attachment_suffix(safe_name)}")
-        n = _pdf_show_attachment(path, att["key"], in_path, deadline)
-        if n < 0:
-            skipped.append({**att, "error": "extract failed"})
-            continue
-        if n > MAX_ATTACHMENT_BYTES:
-            skipped.append({**att, "error": "attachment too large"})
+        try:
+            _n, error = _pdf_take_attachment(path, att["key"], in_path, deadline)
+        except _AttachmentBudgetSpent as stop:
+            actions.append(
+                f"warning: {len(attachments) - i} embedded file(s) left unprocessed: {stop}"
+            )
+            return ok, skipped, True
+        if error:
+            skipped.append({**att, "error": error})
+            truncated = truncated or error == "attachment byte budget exhausted"
             continue
         ok.append({**att, "in_path": in_path})
-    return ok, skipped
+    return ok, skipped, truncated
 
 
 def _pdf_clean_attachments(
@@ -4094,40 +4478,61 @@ def _pdf_clean_attachments(
     Attachments are extracted from *path* (the original, unmodified input) and
     re-embedded into *dest*, because some earlier pass (the Ghostscript
     deep-image re-distill) may have dropped them from *dest*. Returns
-    ``{"attachments": [...], "processed": bool, "qpdf_absent": bool}``.
+    ``{"attachments": [...], "processed": bool, "qpdf_absent": bool,
+    "truncated": bool}``.
     """
     qpdf = which("qpdf")
     if not qpdf:
         actions.append(
             "warning: embedded-file attachments left in place; install qpdf for the attachment pass"
         )
-        return {"attachments": [], "processed": False, "qpdf_absent": True}
+        return {"attachments": [], "processed": False, "qpdf_absent": True, "truncated": False}
     if depth > MAX_ATTACHMENT_DEPTH:
         actions.append(f"warning: attachment recursion capped at depth {MAX_ATTACHMENT_DEPTH}")
-        return {"attachments": [], "processed": False, "qpdf_absent": False}
-    if deadline is not None and deadline.spent():
+        return {"attachments": [], "processed": False, "qpdf_absent": False, "truncated": True}
+    if deadline is None:
+        deadline = _Deadline(PDF_CLEAN_BUDGET_SECONDS)
+    if deadline.spent():
         actions.append("attachment pass skipped: clean budget exhausted")
-        return {"attachments": [], "processed": False, "qpdf_absent": False}
+        return {"attachments": [], "processed": False, "qpdf_absent": False, "truncated": True}
 
     results: list[dict] = []
     processed = False
     with tempfile.TemporaryDirectory(prefix="wr-att-") as staging:
-        attachments, skipped = _pdf_extract_attachments(path, deadline, Path(staging))
+        attachments, skipped, truncated = _pdf_extract_attachments(
+            path, deadline, Path(staging), actions
+        )
         if skipped:
             for att in skipped:
                 actions.append(f"skipped attachment '{att['name']}': {att['error']}")
                 results.append({**att, "kind": "unknown", "cleaned": False, "error": att["error"]})
         if not attachments:
-            if not skipped:
+            if not skipped and not truncated:
                 actions.append("no embedded attachments to clean")
-            return {"attachments": results, "processed": False, "qpdf_absent": False}
+            return {
+                "attachments": results,
+                "processed": False,
+                "qpdf_absent": False,
+                "truncated": truncated,
+            }
 
         # Did a re-distill drop the attachments from dest? If not, re-embedding
         # only the changed ones is enough; if so, every attachment is restored.
-        dest_has = bool(_pdf_attachment_list(dest, deadline))
+        # A listing that did not finish is not "dest has none": that reading
+        # re-adds files that are still embedded.
+        on_dest, dest_listed = _pdf_attachment_index(dest, deadline, limit=1)
+        if dest_listed < 0:
+            actions.append(
+                "warning: could not list attachments on output; left existing entries in place"
+            )
+            dest_has = True
+            truncated = True
+        else:
+            dest_has = bool(on_dest)
         for i, att in enumerate(attachments):
-            if deadline is not None and deadline.spent():
+            if deadline.spent():
                 actions.append("attachment pass stopped: clean budget exhausted")
+                truncated = True
                 break
             name = att["name"]
             in_path = att["in_path"]
@@ -4158,7 +4563,9 @@ def _pdf_clean_attachments(
                 ):
                     results[-1]["error"] = "re-embed failed"
                 continue
-            cleaned_bytes, clean_actions = _clean_attachment_bytes(in_path, data, kind, mode, depth)
+            cleaned_bytes, clean_actions = _clean_attachment_bytes(
+                in_path, data, kind, mode, depth, deadline
+            )
             if cleaned_bytes is None:
                 results.append(
                     {**report_att, "kind": kind, "cleaned": False, "error": "clean failed"}
@@ -4199,7 +4606,12 @@ def _pdf_clean_attachments(
 
     if processed:
         actions.append("embedded-file attachments cleaned")
-    return {"attachments": results, "processed": processed, "qpdf_absent": False}
+    return {
+        "attachments": results,
+        "processed": processed,
+        "qpdf_absent": False,
+        "truncated": truncated,
+    }
 
 
 def _add_attachment(
@@ -4238,6 +4650,8 @@ def _add_attachment(
     qpdf = which("qpdf")
     if not qpdf:
         return False
+    if deadline is not None and deadline.spent():
+        return False
     try:
         r = subprocess.run(
             [qpdf, *cmd],
@@ -4260,7 +4674,12 @@ def _add_attachment(
 
 
 def _clean_attachment_bytes(
-    tmp: Path, data: bytes, kind: str, mode: str, depth: int
+    tmp: Path,
+    data: bytes,
+    kind: str,
+    mode: str,
+    depth: int,
+    deadline: "_Deadline | None" = None,
 ) -> tuple[bytes | None, list[str]]:
     """Clean an extracted attachment with the matching unified pipeline."""
     if kind == "text":
@@ -4299,6 +4718,7 @@ def _clean_attachment_bytes(
             normalize_spaces=True,
             clean_attachments=mode,
             _depth=depth + 1,
+            _deadline=deadline,
         )
         if not dest.is_file():
             return None, []
@@ -4313,6 +4733,7 @@ def clean_pdf(
     deep_images: str = "auto",
     clean_attachments: str = DEFAULT_CLEAN_ATTACHMENTS,
     depth: int = 0,
+    deadline: "_Deadline | None" = None,
 ) -> tuple[list[str], dict]:
     """Best-effort PDF clean. Prefers exiftool; falls back to XMP strip warning.
 
@@ -4336,8 +4757,11 @@ def clean_pdf(
     * ``"auto"`` -- clean an attachment only when it carries AI/C2PA provenance
       markers; recurse with the same rule.
     * ``"never"`` -- leave attachments untouched.
+
+    ``deadline`` is the enclosing clean's budget when this PDF is itself an
+    attachment; a top-level call starts its own.
     """
-    actions: list[str] = []
+    actions = actions_list()
     data = path.read_bytes()
     dest.parent.mkdir(parents=True, exist_ok=True)
 
@@ -4353,7 +4777,8 @@ def clean_pdf(
             f"got {clean_attachments!r}"
         )
 
-    deadline = _Deadline(PDF_CLEAN_BUDGET_SECONDS)
+    if deadline is None:
+        deadline = _Deadline(PDF_CLEAN_BUDGET_SECONDS)
 
     exiftool = which("exiftool")
     rewritten = False
@@ -4512,6 +4937,8 @@ def clean_pdf(
         "attachments": attachments["attachments"],
         "attachments_processed": attachments["processed"],
     }
+    if attachments.get("truncated"):
+        meta["attachments_truncated"] = True
     if not exiftool:
         # The deep pass may well have run, but the document-level strip was
         # the stdlib one, so the result is still best-effort.
@@ -4604,24 +5031,23 @@ def inspect_container(
     elif fmt == "epub":
         from text_unicode import inspect_text  # local import to avoid cycles
 
-        encrypted = _epub_encrypted_parts(data)
+        enc = _epub_encryption(data)
         budget: list[int] = [0]
         try:
             with zipfile.ZipFile(io.BytesIO(data)) as zf:
                 for info in zf.infolist():
-                    if info.filename in encrypted:
+                    if not info.filename.lower().endswith((".xhtml", ".html", ".htm")):
                         continue
-                    if info.filename.lower().endswith((".xhtml", ".html", ".htm")):
-                        ta = inspect_text(
-                            _read_zip_member(zf, info, budget).decode(
-                                "utf-8", errors="surrogateescape"
-                            )
-                        ).to_dict()
+                    raw = _read_zip_member(zf, info, budget)
+                    # An unreadable part was already reported as unread by
+                    # inspect_epub; its bytes carry no text to count.
+                    for label, view in _epub_scan_views(enc, info.filename, raw) or ():
+                        ta = inspect_text(view.decode("utf-8", errors="surrogateescape")).to_dict()
                         layer_a_total += ta["suspicious_total"]
                         for h in ta["hits"]:
                             layer_a_hits.append(h)
                             findings.append(
-                                f"layer-a ({info.filename}): {h['codepoint']} {h['label']} "
+                                f"layer-a ({label}): {h['codepoint']} {h['label']} "
                                 f"x{h['count']} ({h['kind']})"
                             )
         except zipfile.BadZipFile:
@@ -4686,6 +5112,7 @@ def clean_container(
     normalize_spaces: bool = True,
     clean_attachments: str = DEFAULT_CLEAN_ATTACHMENTS,
     _depth: int = 0,
+    _deadline: "_Deadline | None" = None,
 ) -> dict[str, Any]:
     """Clean container metadata; optionally Layer-A scrub text bodies for md/html.
 
@@ -4698,7 +5125,9 @@ def clean_container(
 
     data = path.read_bytes()
     fmt = fmt or detect_container_format(path, data)
-    actions: list[str] = []
+    # Each format branch assigns this. An empty actions_list() here is a dead
+    # store: every path overwrites it, or raises, before the result is read.
+    actions: list[str]
     if fmt in {"docx", "xlsx", "pptx"}:
         owner_file = office_owner_file(path)
         if owner_file is not None:
@@ -4718,6 +5147,7 @@ def clean_container(
             deep_images=deep_images,
             clean_attachments=clean_attachments,
             depth=_depth,
+            deadline=_deadline,
         )
         meta.update(meta_extra)
     elif fmt == "docx":
@@ -4781,7 +5211,7 @@ def clean_container(
     else:
         raise ValueError(f"unsupported container format: {fmt}")
 
-    after = inspect_container(dest)
+    after = inspect_container(dest, deadline=_deadline)
     changed = dest.read_bytes() != data
     return {
         "input": str(path),

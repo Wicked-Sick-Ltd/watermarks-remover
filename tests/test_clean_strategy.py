@@ -75,7 +75,7 @@ def test_apply_strategy_sequentially(monkeypatch):
         return "PARAPHRASED "
 
     monkeypatch.setattr(rewrite_text, "_generate_once", fake_gen)
-    monkeypatch.setattr(rewrite_text, "_mlm_infill", lambda text, level: text + " [mlm]")
+    monkeypatch.setattr(rewrite_text, "_mlm_infill", lambda text, level, **_kwargs: text + " [mlm]")
 
     out, stats = apply_strategy(
         "Hello world.",
@@ -110,7 +110,9 @@ def test_apply_strategy_llm_requires_config(monkeypatch):
 
 
 def test_apply_strategy_mlm_only(monkeypatch):
-    monkeypatch.setattr(rewrite_text, "_mlm_infill", lambda text, level: text + " edited")
+    monkeypatch.setattr(
+        rewrite_text, "_mlm_infill", lambda text, level, **_kwargs: text + " edited"
+    )
     out, stats = apply_strategy(
         "hi", [("mlm", 0.3)], backend="openai-compatible", model=None, base_url=None, api_key=None
     )

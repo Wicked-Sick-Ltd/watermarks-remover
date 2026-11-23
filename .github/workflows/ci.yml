@@ -11,14 +11,17 @@ permissions:
 jobs:
   test:
     strategy:
+      # 3.13 is the default elsewhere. 3.14 is tested and must pass: the
+      # test dependencies publish 3.14 wheels.
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.12", "3.13", "3.14"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install test deps
         run: python -m pip install -r requirements-dev.txt
@@ -66,7 +69,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
+          python-version: "3.13"
 
       - name: Install test deps
         run: python -m pip install -r requirements-dev.txt
@@ -92,7 +95,9 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
+          # CI default. CtrlRegen's image stays python:3.11-slim; its research
+          # pins are documented as having no 3.14 wheels and are not a test leg.
+          python-version: "3.13"
       - name: Validate optional backend requirements resolve
         run: |
           set -euo pipefail

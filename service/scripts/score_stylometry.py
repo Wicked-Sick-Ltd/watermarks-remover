@@ -17,8 +17,10 @@ import argparse
 import math
 import re
 import sys
-from collections import Counter
+from collections import Counter, deque
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -197,34 +199,89 @@ class StylometryReport:
         }
 
 
-def extract_sentences(text: str) -> list[str]:
-    """Split text into sentences while ignoring blank lines and code block markers."""
-    clean_lines = []
+# Runs between str.splitlines() boundaries. Matching runs instead of calling
+# splitlines() keeps one line alive at a time rather than a list of all of them.
+RE_LINE = re.compile(r"[^\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]+")
+RE_SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+")
+
+MARKER_SAMPLE_LIMIT = 3
+MARKER_SPAN_LIMIT = 10
+
+# Uploads reach the scorer at up to MAX_INPUT_BYTES, which is room for over a
+# hundred million short words or sentences. Every pass below is a generator or
+# a fixed-size window: holding one Python object per token, sentence or match
+# made peak memory tens of times the upload and could OOM the threaded server.
+
+
+def iter_sentences(text: str) -> Iterator[str]:
+    """Yield sentences one at a time, skipping blank lines and fenced code blocks."""
     in_code_block = False
-    for line in text.splitlines():
-        trimmed = line.strip()
+    for line in RE_LINE.finditer(text):
+        trimmed = line.group(0).strip()
         if trimmed.startswith("```"):
             in_code_block = not in_code_block
             continue
         if in_code_block or not trimmed:
             continue
-        clean_lines.append(trimmed)
+        start = 0
+        for brk in RE_SENTENCE_BREAK.finditer(trimmed):
+            piece = trimmed[start : brk.start()].strip()
+            if piece:
+                yield piece
+            start = brk.end()
+        piece = trimmed[start:].strip()
+        if piece:
+            yield piece
 
-    raw_text = "\n".join(clean_lines)
-    if not raw_text.strip():
-        return []
 
-    chunks = re.split(r"(?<=[.!?])\s+|\n+", raw_text)
-    sentences = [s.strip() for s in chunks if s.strip()]
-    return sentences
+def extract_sentences(text: str) -> list[str]:
+    """Split text into sentences while ignoring blank lines and code block markers."""
+    return list(iter_sentences(text))
+
+
+def iter_words(text: str) -> Iterator[str]:
+    """Yield normalized alphanumeric word tokens one at a time."""
+    for m in RE_WORDS.finditer(text):
+        yield m.group(0).lower()
 
 
 def extract_words(text: str) -> list[str]:
     """Extract normalized alphanumeric word tokens."""
-    return [w.lower() for w in RE_WORDS.findall(text)]
+    return list(iter_words(text))
 
 
-def compute_burstiness(sentences: list[str]) -> tuple[float, float, float | None]:
+def _count_words(text: str) -> int:
+    return sum(1 for _ in RE_WORDS.finditer(text))
+
+
+def _sentence_stats(sentences: Iterable[str]) -> tuple[int, float, float, float | None]:
+    """Return (sentence_count, mean, std_dev, cv) in one pass over *sentences*."""
+    sentence_count = 0
+    n = 0
+    total = 0
+    total_sq = 0
+    for s in sentences:
+        sentence_count += 1
+        length = _count_words(s)
+        if length > 0:
+            n += 1
+            total += length
+            total_sq += length * length
+
+    if sentence_count == 0:
+        return 0, 0.0, 0.0, None
+    if n < 2:
+        return sentence_count, float(total), 0.0, None
+
+    mean_len = total / n
+    # Integer sums keep the variance exact until the single final division.
+    variance = (n * total_sq - total * total) / (n * (n - 1))
+    std_dev = math.sqrt(variance)
+    cv = (std_dev / mean_len) if mean_len > 0 else 0.0
+    return sentence_count, mean_len, std_dev, cv
+
+
+def compute_burstiness(sentences: Iterable[str]) -> tuple[float, float, float | None]:
     """Compute mean sentence word length, standard deviation, and coefficient of variation (CV).
 
     CV is ``None`` when it cannot be measured (no sentences, or fewer than two
@@ -232,67 +289,63 @@ def compute_burstiness(sentences: list[str]) -> tuple[float, float, float | None
     made the caller's tiering read "perfectly uniform" — the strongest
     LLM-likeness signal — for text whose body yielded no sentences at all (#132).
     """
-    if not sentences:
-        return 0.0, 0.0, None
-
-    lengths = [len(extract_words(s)) for s in sentences]
-    lengths = [L for L in lengths if L > 0]
-    if len(lengths) < 2:
-        mean_len = float(lengths[0]) if lengths else 0.0
-        return mean_len, 0.0, None
-
-    mean_len = sum(lengths) / len(lengths)
-    variance = sum((x - mean_len) ** 2 for x in lengths) / (len(lengths) - 1)
-    std_dev = math.sqrt(variance)
-    cv = (std_dev / mean_len) if mean_len > 0 else 0.0
+    _, mean_len, std_dev, cv = _sentence_stats(sentences)
     return mean_len, std_dev, cv
 
 
-def compute_mattr(words: list[str], window_size: int = 50) -> float:
-    """Compute Moving-Average Type-Token Ratio (MATTR) across sliding windows."""
-    n = len(words)
+def _word_stats(words: Iterable[str], window_size: int = 50) -> tuple[int, float]:
+    """Return (word_count, MATTR) in one pass, holding only *window_size* words."""
+    it = iter(words)
+    window = deque(islice(it, window_size))
+    n = len(window)
     if n == 0:
-        return 0.0
-    if n <= window_size:
-        return len(set(words)) / n
+        return 0, 0.0
+    current_window = Counter(window)
+    if n < window_size:
+        return n, len(current_window) / n
 
-    total_ttr = 0.0
-    num_windows = n - window_size + 1
-    # Sliding window counts
-    current_window = Counter(words[:window_size])
-    total_ttr += len(current_window) / window_size
-
-    for i in range(1, num_windows):
-        leaving_word = words[i - 1]
-        entering_word = words[i + window_size - 1]
-
+    total_ttr = len(current_window) / window_size
+    num_windows = 1
+    for entering_word in it:
+        leaving_word = window.popleft()
         current_window[leaving_word] -= 1
         if current_window[leaving_word] == 0:
             del current_window[leaving_word]
 
+        window.append(entering_word)
         current_window[entering_word] += 1
         total_ttr += len(current_window) / window_size
+        num_windows += 1
 
-    return total_ttr / num_windows
+    return n + num_windows - 1, total_ttr / num_windows
+
+
+def compute_mattr(words: Iterable[str], window_size: int = 50) -> float:
+    """Compute Moving-Average Type-Token Ratio (MATTR) across sliding windows."""
+    return _word_stats(words, window_size)[1]
 
 
 def scan_ai_phrases(text: str) -> list[MarkerMatch]:
     """Find and tally high-frequency AI cadence phrases."""
     matches: list[MarkerMatch] = []
     for pattern, label, weight in AI_PHRASE_PATTERNS:
-        found_spans = []
+        count = 0
+        samples: list[str] = []
         offsets: list[tuple[int, int]] = []
         for m in re.finditer(pattern, text, re.IGNORECASE):
-            found_spans.append(m.group(0))
-            offsets.append((m.start(), m.end()))
-        if found_spans:
+            if count < MARKER_SAMPLE_LIMIT:
+                samples.append(m.group(0))
+            if count < MARKER_SPAN_LIMIT:
+                offsets.append((m.start(), m.end()))
+            count += 1
+        if count:
             matches.append(
                 MarkerMatch(
                     phrase=label,
-                    count=len(found_spans),
+                    count=count,
                     weight=weight,
-                    samples=found_spans[:3],
-                    spans=offsets[:10],
+                    samples=samples,
+                    spans=offsets,
                 )
             )
     return matches
@@ -317,10 +370,8 @@ def classify_density(score: float | None) -> str:
 
 def score_text_stylometry(text: str, path: str = "<text>") -> StylometryReport:
     """Run full multi-dimensional stylometric analysis and return a structured report."""
-    words = extract_words(text)
-    word_count = len(words)
-    sentences = extract_sentences(text)
-    sentence_count = len(sentences)
+    word_count, mattr = _word_stats(iter_words(text))
+    sentence_count, _, _, cv = _sentence_stats(iter_sentences(text))
 
     findings: list[str] = []
     notes: list[str] = []
@@ -339,7 +390,7 @@ def score_text_stylometry(text: str, path: str = "<text>") -> StylometryReport:
             word_count=word_count,
             sentence_count=sentence_count,
             burstiness_cv=None,
-            lexical_diversity=compute_mattr(words),
+            lexical_diversity=mattr,
             ai_ngram_density=0.0,
             matched_markers=[m.to_dict() for m in marker_matches],
             score=None,
@@ -351,8 +402,6 @@ def score_text_stylometry(text: str, path: str = "<text>") -> StylometryReport:
         )
 
     # 2. Metric Calculations
-    _, _, cv = compute_burstiness(sentences)
-    mattr = compute_mattr(words)
     marker_matches = scan_ai_phrases(text)
 
     # N-gram density: weighted marker instances per 100 words
